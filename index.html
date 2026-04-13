@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Share — CAQ Newsroom</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    /* ── Design tokens — match MyCroquet globals.css ── */
+    :root {
+      --background:        #FAFAF8;
+      --foreground:        #1a1a1a;
+      --muted:             #f4f4f2;
+      --muted-fg:          #737373;
+      --border:            #e8e6e3;
+      --accent:            #73182C;
+      --accent-hover:      #8a1e35;
+      --accent-muted:      rgba(115, 24, 44, 0.07);
+      --ring:              rgba(115, 24, 44, 0.12);
+      --green:             #82b25e;
+      --green-muted:       rgba(130, 178, 94, 0.1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+      background: var(--background);
+      color: var(--foreground);
+      min-height: 100vh;
+      padding: 0 0 60px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Header ── */
+    .header {
+      background: var(--accent);
+      color: white;
+      padding: 20px 20px 18px;
+      text-align: center;
+    }
+    .header-eyebrow {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.75;
+      margin-bottom: 4px;
+    }
+    .header h1 {
+      font-family: 'Inter', sans-serif;
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .header p {
+      font-size: 0.82rem;
+      opacity: 0.8;
+      margin-top: 4px;
+    }
+
+    /* ── Page content ── */
+    .page {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* ── Card / Section ── */
+    .card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .card-label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted-fg);
+      margin-bottom: 12px;
+    }
+
+    /* ── Empty-state add button ── */
+    .capture-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 28px 16px;
+      background: var(--muted);
+      border: 1.5px dashed var(--border);
+      border-radius: 10px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .capture-btn:active {
+      background: var(--accent-muted);
+      border-color: var(--accent);
+    }
+    .capture-icon {
+      width: 40px;
+      height: 40px;
+      background: var(--accent);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .capture-icon svg { display: block; }
+    .capture-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--foreground);
+    }
+    .capture-sub {
+      font-size: 0.78rem;
+      color: var(--muted-fg);
+    }
+
+    /* ── Thumbnail grid (shown once files selected) ── */
+    .media-grid {
+      display: none;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+    }
+    .media-grid.has-files { display: grid; }
+
+    .thumb {
+      position: relative;
+      aspect-ratio: 1;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #000;
+    }
+    .thumb img,
+    .thumb video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .thumb-remove {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      background: rgba(0,0,0,0.6);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 22px;
+      height: 22px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .thumb-cover {
+      position: absolute;
+      bottom: 4px;
+      left: 4px;
+      background: var(--accent);
+      color: white;
+      font-size: 0.55rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 2px 5px;
+      border-radius: 3px;
+    }
+    /* "Add more" tile */
+    .thumb-add {
+      aspect-ratio: 1;
+      border-radius: 8px;
+      border: 1.5px dashed var(--border);
+      background: var(--muted);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      color: var(--muted-fg);
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .thumb-add:active {
+      background: var(--accent-muted);
+      border-color: var(--accent);
+    }
+    .thumb-add svg { opacity: 0.5; }
+
+    /* ── Voice ── */
+    .caption-label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .voice-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      border: 1.5px solid var(--border);
+      background: white;
+      color: var(--muted-fg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+      flex-shrink: 0;
+    }
+    .voice-btn:active { background: var(--muted); }
+    .voice-btn.recording {
+      background: #fef2f2;
+      border-color: #dc2626;
+      color: #dc2626;
+      animation: recordPulse 1.4s ease-in-out infinite;
+    }
+    .voice-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    @keyframes recordPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.15); }
+      50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0.08); }
+    }
+    .voice-label {
+      font-size: 0.65rem;
+      color: var(--muted-fg);
+      text-align: right;
+      margin-top: 4px;
+      min-height: 12px;
+    }
+    .voice-status {
+      font-size: 0.78rem;
+      color: var(--muted-fg);
+      margin-top: 6px;
+      min-height: 14px;
+    }
+
+    /* ── Form fields ── */
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field + .field { margin-top: 14px; }
+    .field label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--muted-fg);
+    }
+    .field input,
+    .field textarea {
+      width: 100%;
+      padding: 11px 13px;
+      font-size: 0.95rem;
+      font-family: inherit;
+      border: 1.5px solid var(--border);
+      border-radius: 8px;
+      background: white;
+      color: var(--foreground);
+      -webkit-appearance: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .field input:focus,
+    .field textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--ring);
+    }
+    .field textarea {
+      min-height: 90px;
+      resize: vertical;
+      line-height: 1.55;
+    }
+
+    /* ── Submit button ── */
+    .submit-btn {
+      width: 100%;
+      padding: 16px;
+      font-size: 1rem;
+      font-weight: 600;
+      font-family: inherit;
+      border: none;
+      border-radius: 10px;
+      background: var(--accent);
+      color: white;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .submit-btn:active { transform: scale(0.98); }
+    .submit-btn:disabled {
+      background: var(--muted-fg);
+      cursor: not-allowed;
+      transform: none;
+    }
+    .submit-error {
+      font-size: 0.82rem;
+      color: #dc2626;
+      text-align: center;
+      min-height: 16px;
+    }
+    .progress-wrap {
+      display: none;
+      margin-top: 8px;
+    }
+    .progress-bar {
+      height: 6px;
+      background: var(--muted);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 0.15s ease;
+    }
+    @keyframes pulse-fill {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.45; }
+    }
+    .progress-fill.pulsing {
+      animation: pulse-fill 1s ease-in-out infinite;
+    }
+    .progress-text {
+      font-size: 0.75rem;
+      color: var(--muted-fg);
+      text-align: center;
+      margin-top: 4px;
+    }
+
+    /* ── Success screen ── */
+    #successScreen {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 80vh;
+      padding: 40px 24px;
+      text-align: center;
+      gap: 12px;
+      max-width: 400px;
+      margin: 0 auto;
+    }
+    .success-check {
+      width: 64px;
+      height: 64px;
+      background: var(--green-muted);
+      border: 2px solid var(--green);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 4px;
+    }
+    .success-check svg { display: block; }
+    #successScreen h2 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--foreground);
+    }
+    #successScreen p {
+      font-size: 0.9rem;
+      color: var(--muted-fg);
+      line-height: 1.6;
+    }
+    .another-btn {
+      margin-top: 8px;
+      padding: 12px 24px;
+      border: 1.5px solid var(--border);
+      border-radius: 8px;
+      background: white;
+      color: var(--foreground);
+      font-size: 0.9rem;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-eyebrow">Croquet Association of Queensland</div>
+    <h1>Share with the Newsroom</h1>
+    <p>Photos, videos &amp; stories from the event</p>
+  </div>
+
+  <!-- Main form -->
+  <div id="mainForm">
+    <div class="page">
+
+      <!-- Media capture -->
+      <div class="card">
+        <div class="card-label">Photos &amp; Videos</div>
+
+        <!-- Thumbnail grid (hidden until files selected) -->
+        <div class="media-grid" id="mediaGrid"></div>
+
+        <!-- Empty-state add button — input overlaid directly so Chrome respects multiple -->
+        <label class="capture-btn" id="cameraBtn" for="galleryInput">
+          <div class="capture-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+              <circle cx="12" cy="13" r="4"/>
+            </svg>
+          </div>
+          <div class="capture-title">Add Photos or Videos</div>
+          <div class="capture-sub">Camera or gallery</div>
+          <input id="galleryInput" type="file" accept="image/*,video/*" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
+        </label>
+      </div>
+
+      <!-- Caption + voice -->
+      <div class="card">
+        <div class="caption-label-row">
+          <div class="card-label" style="margin-bottom:0;">What's happening?</div>
+          <button class="voice-btn" id="voiceBtn" type="button" aria-label="Record voice">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
+        </div>
+        <div class="voice-label" id="voiceLabel" style="text-align:right;">Talk to text</div>
+        <div class="voice-status" id="voiceStatus"></div>
+        <textarea id="captionField" class="field" style="width:100%;margin-top:8px;padding:11px 13px;font-size:0.95rem;font-family:inherit;border:1.5px solid var(--border);border-radius:8px;background:white;color:var(--foreground);min-height:90px;resize:vertical;line-height:1.55;-webkit-appearance:none;transition:border-color 0.15s;" placeholder="Who's playing, what happened, any great moments…"></textarea>
+      </div>
+
+      <!-- Name + Event -->
+      <div class="card">
+        <div class="field">
+          <label for="nameField">Your Name *</label>
+          <input id="nameField" type="text" placeholder="e.g. Sarah Johnson" autocomplete="name">
+        </div>
+        <div class="field">
+          <label for="eventField">Event (optional)</label>
+          <input id="eventField" type="text" placeholder="e.g. Perth Eire Cup 2026" autocomplete="off">
+        </div>
+      </div>
+
+      <!-- Submit -->
+      <div class="submit-error" id="submitError"></div>
+      <button class="submit-btn" id="submitBtn" type="button">Send to Newsroom</button>
+      <div class="progress-wrap" id="progressWrap">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-text" id="progressText"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Success -->
+  <div id="successScreen">
+    <div class="success-check">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#82b25e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="20 6 9 17 4 12"/>
+      </svg>
+    </div>
+    <h2>Sent to the newsroom</h2>
+    <p>Thanks — the editorial team will review your submission and publish it shortly.</p>
+    <button class="another-btn" id="anotherBtn" type="button">Submit another</button>
+  </div>
+
+  <script>
+  // ── Media capture ──────────────────────────────────────────────────────────
+
+  const cameraBtn    = document.getElementById('cameraBtn');
+  const galleryInput = document.getElementById('galleryInput');
+  const mediaGrid    = document.getElementById('mediaGrid');
+
+  let selectedFiles = [];  // array of { file, objectUrl }
+
+  // cameraBtn is now a <label for="galleryInput"> — no JS click handler needed
+
+  function renderGrid() {
+    // Revoke old URLs handled individually on remove
+    mediaGrid.innerHTML = '';
+
+    selectedFiles.forEach(({ file, objectUrl }, idx) => {
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+
+      if (file.type.startsWith('video/')) {
+        const vid = document.createElement('video');
+        vid.src = objectUrl;
+        vid.playsInline = true;
+        vid.muted = true;
+        thumb.appendChild(vid);
+      } else {
+        const img = document.createElement('img');
+        img.src = objectUrl;
+        img.alt = '';
+        thumb.appendChild(img);
+      }
+
+      // Cover badge on first item
+      if (idx === 0) {
+        const badge = document.createElement('div');
+        badge.className = 'thumb-cover';
+        badge.textContent = 'Cover';
+        thumb.appendChild(badge);
+      }
+
+      // Remove button
+      const rm = document.createElement('button');
+      rm.className = 'thumb-remove';
+      rm.setAttribute('aria-label', 'Remove');
+      rm.textContent = '✕';
+      rm.addEventListener('click', () => {
+        URL.revokeObjectURL(objectUrl);
+        selectedFiles.splice(idx, 1);
+        renderGrid();
+      });
+      thumb.appendChild(rm);
+      mediaGrid.appendChild(thumb);
+    });
+
+    // "Add more" tile — label triggers a fresh hidden input natively (Chrome multi-select fix)
+    if (selectedFiles.length > 0) {
+      const addId = 'addMoreInput';
+      const old = document.getElementById(addId);
+      if (old) old.remove();
+
+      const addInput = document.createElement('input');
+      addInput.type = 'file';
+      addInput.id = addId;
+      addInput.accept = 'image/*,video/*';
+      addInput.multiple = true;
+      addInput.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;';
+      addInput.addEventListener('change', () => {
+        const files = Array.from(addInput.files || []);
+        if (files.length) addFiles(files);
+        addInput.value = '';
+      });
+
+      const addTile = document.createElement('label');
+      addTile.className = 'thumb-add';
+      addTile.setAttribute('for', addId);
+      addTile.innerHTML = `
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        <span>Add more</span>`;
+      addTile.appendChild(addInput);
+      mediaGrid.appendChild(addTile);
+    }
+
+    const hasFiles = selectedFiles.length > 0;
+    mediaGrid.classList.toggle('has-files', hasFiles);
+    cameraBtn.style.display = hasFiles ? 'none' : '';
+  }
+
+  function addFiles(newFiles) {
+    for (const file of newFiles) {
+      selectedFiles.push({ file, objectUrl: URL.createObjectURL(file) });
+    }
+    renderGrid();
+  }
+
+  galleryInput.addEventListener('change', () => {
+    const files = Array.from(galleryInput.files || []);
+    if (files.length) addFiles(files);
+    galleryInput.value = '';
+  });
+
+  // ── Voice transcription ────────────────────────────────────────────────────
+
+  const voiceBtn    = document.getElementById('voiceBtn');
+  const voiceLabel  = document.getElementById('voiceLabel');
+  const voiceStatus = document.getElementById('voiceStatus');
+  const captionField = document.getElementById('captionField');
+
+  let recognition  = null;
+  let isRecording  = false;
+  let accumulated  = '';   // finals from previous Android restarts
+  let sessionFinal = '';   // finals from current recognition session
+  let preVoice     = '';   // what was in the textarea before we started
+  let wakeLock     = null;
+
+  const MIC_SVG  = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>`;
+  const STOP_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+
+  function setCaption(voiceText) {
+    captionField.value = preVoice
+      ? preVoice.trimEnd() + '\n\n' + voiceText
+      : voiceText;
+  }
+
+  function initRecognition() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      voiceStatus.textContent = 'Speech recognition not supported — use Chrome or Safari.';
+      voiceBtn.disabled = true;
+      return false;
+    }
+    recognition = new SR();
+    recognition.continuous     = true;
+    recognition.interimResults = true;
+    recognition.lang           = 'en-AU';
+
+    recognition.onresult = (event) => {
+      sessionFinal = '';
+      let interim  = '';
+      for (let i = 0; i < event.results.length; i++) {
+        if (event.results[i].isFinal) sessionFinal += event.results[i][0].transcript + ' ';
+        else interim += event.results[i][0].transcript;
+      }
+      // Write live to the textarea as words come in
+      setCaption(accumulated + sessionFinal + interim);
+    };
+
+    recognition.onerror = (e) => {
+      if (e.error === 'no-speech') return;
+      voiceStatus.textContent = 'Error: ' + e.error;
+      stopVoice(false);
+    };
+
+    recognition.onend = () => {
+      if (isRecording) {
+        accumulated  += sessionFinal;
+        sessionFinal  = '';
+        recognition.start();
+      }
+    };
+    return true;
+  }
+
+  async function startVoice() {
+    if (!recognition && !initRecognition()) return;
+    preVoice     = captionField.value;
+    accumulated  = '';
+    sessionFinal = '';
+    isRecording  = true;
+    if ('wakeLock' in navigator) {
+      try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+    }
+    voiceBtn.classList.add('recording');
+    voiceBtn.innerHTML      = STOP_SVG;
+    voiceLabel.textContent  = 'Tap to stop';
+    voiceStatus.textContent = 'Listening…';
+    captionField.style.borderColor = '#dc2626';
+    recognition.start();
+  }
+
+  async function stopVoice(clean = true) {
+    isRecording = false;
+    if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    if (recognition) recognition.stop();
+    voiceBtn.classList.remove('recording');
+    voiceBtn.innerHTML     = MIC_SVG;
+    voiceLabel.textContent = 'Talk to text';
+    captionField.style.borderColor = '';
+
+    const raw = (accumulated + sessionFinal).trim();
+    if (!clean || !raw) {
+      if (clean) voiceStatus.textContent = 'Nothing heard — try again.';
+      return;
+    }
+
+    voiceStatus.textContent = 'Tidying up…';
+    voiceBtn.disabled = true;
+    try {
+      const res  = await fetch('/clean', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ text: raw }),
+      });
+      const data = await res.json();
+      setCaption(data.cleaned || raw);
+      voiceStatus.textContent = '';
+    } catch {
+      // /clean failed — raw transcript is already in the textarea, leave it
+      voiceStatus.textContent = '';
+    } finally {
+      voiceBtn.disabled = false;
+    }
+  }
+
+  voiceBtn.addEventListener('click', () => {
+    isRecording ? stopVoice() : startVoice();
+  });
+
+  // ── Submit ─────────────────────────────────────────────────────────────────
+
+  const submitBtn    = document.getElementById('submitBtn');
+  const submitError  = document.getElementById('submitError');
+  const nameField    = document.getElementById('nameField');
+  const eventField   = document.getElementById('eventField');
+  const mainForm     = document.getElementById('mainForm');
+  const successScreen = document.getElementById('successScreen');
+  const progressWrap = document.getElementById('progressWrap');
+  const progressFill = document.getElementById('progressFill');
+  const progressText = document.getElementById('progressText');
+
+  submitBtn.addEventListener('click', async () => {
+    submitError.textContent = '';
+    const name = nameField.value.trim();
+    if (!name) {
+      submitError.textContent = 'Please enter your name.';
+      nameField.focus();
+      return;
+    }
+    const caption = captionField.value.trim();
+    if (!selectedFiles.length && !caption) {
+      submitError.textContent = 'Please add a photo, video, or write something.';
+      return;
+    }
+
+    submitBtn.disabled    = true;
+    submitBtn.textContent = 'Sending…';
+
+    try {
+      const fd = new FormData();
+      fd.append('name',    name);
+      fd.append('event',   eventField.value.trim());
+      fd.append('caption', caption);
+      for (const { file } of selectedFiles) fd.append('files', file);
+
+      await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/submit');
+        progressWrap.style.display = 'block';
+        progressFill.style.width = '0%';
+        progressText.textContent = 'Uploading…';
+
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 90);
+            progressFill.style.width = pct + '%';
+            progressText.textContent = `Uploading… ${pct}%`;
+          }
+        };
+
+        xhr.upload.onloadend = () => {
+          progressFill.style.width = '90%';
+          progressFill.classList.add('pulsing');
+          progressText.textContent = 'Processing…';
+        };
+
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            progressFill.classList.remove('pulsing');
+            progressFill.style.width = '100%';
+            progressText.textContent = '';
+            resolve();
+          } else {
+            reject(new Error(xhr.responseText || 'Submission failed.'));
+          }
+        };
+        xhr.onerror = () => reject(new Error('Network error — please try again.'));
+        xhr.send(fd);
+      });
+
+      mainForm.style.display    = 'none';
+      successScreen.style.display = 'flex';
+      window.scrollTo(0, 0);
+    } catch (e) {
+      submitError.textContent = e.message || 'Something went wrong — please try again.';
+      submitBtn.disabled      = false;
+      submitBtn.textContent   = 'Send to Newsroom';
+      progressWrap.style.display = 'none';
+      progressFill.classList.remove('pulsing');
+    }
+  });
+
+  document.getElementById('anotherBtn').addEventListener('click', () => {
+    for (const { objectUrl } of selectedFiles) URL.revokeObjectURL(objectUrl);
+    selectedFiles = [];
+    renderGrid();
+    captionField.value          = '';
+    nameField.value             = '';
+    eventField.value            = '';
+    voiceStatus.textContent     = '';
+    submitError.textContent     = '';
+    submitBtn.disabled          = false;
+    submitBtn.textContent       = 'Send to Newsroom';
+    progressWrap.style.display  = 'none';
+    progressFill.style.width    = '0%';
+    progressFill.classList.remove('pulsing');
+    successScreen.style.display = 'none';
+    mainForm.style.display      = 'block';
+    window.scrollTo(0, 0);
+  });
+  </script>
+</body>
+</html>
