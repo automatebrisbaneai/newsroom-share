@@ -38,6 +38,8 @@
         background: white;
         color: #1a1a1a;
         min-height: 90px;
+        max-height: 50vh;
+        overflow-y: auto;
         line-height: 1.55;
         word-wrap: break-word;
       }
@@ -74,6 +76,20 @@
         animation: vttPulse 1.4s ease-in-out infinite;
       }
       .vtt-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+      .vtt-edit-hint {
+        font-size: 0.72rem;
+        color: #73182C;
+        text-align: center;
+        margin-top: 6px;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+      .vtt-edit-hint.vtt-visible { opacity: 1; }
+      .vtt-textarea-highlight {
+        border-color: #73182C !important;
+        box-shadow: 0 0 0 3px rgba(115, 24, 44, 0.1) !important;
+        transition: border-color 0.3s, box-shadow 0.3s;
+      }
       @keyframes vttPulse {
         0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.15); }
         50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0.08); }
@@ -174,6 +190,12 @@
       btnEl.classList.add('vtt-btn');
     }
 
+    // Edit hint — appears after cleanup to nudge users to review
+    const hintEl = document.createElement('div');
+    hintEl.className = 'vtt-edit-hint';
+    hintEl.textContent = 'Tap the text above to review and edit';
+    targetEl.parentNode.insertBefore(hintEl, targetEl.nextSibling);
+
     // ── State ────────────────────────────────────────────────────────────
     let recognition  = null;
     let isRecording  = false;
@@ -241,6 +263,8 @@
       btnEl.innerHTML = STOP_SVG;
       if (labelEl)  labelEl.textContent  = 'Tap to stop';
       if (statusEl) statusEl.textContent = 'Listening\u2026';
+      hintEl.classList.remove('vtt-visible');
+      targetEl.classList.remove('vtt-textarea-highlight');
       targetEl.style.display  = 'none';
       interimEl.style.display = 'block';
       interimEl.innerHTML     = '';
@@ -284,6 +308,22 @@
         interimEl.style.display = 'none';
         targetEl.style.display  = '';
         btnEl.disabled = false;
+
+        // Highlight textarea and show edit hint
+        if (targetEl.value.trim()) {
+          targetEl.classList.add('vtt-textarea-highlight');
+          hintEl.classList.add('vtt-visible');
+          setTimeout(() => {
+            targetEl.classList.remove('vtt-textarea-highlight');
+            hintEl.classList.remove('vtt-visible');
+          }, 5000);
+          // Dismiss hint on tap
+          targetEl.addEventListener('focus', function dismissHint() {
+            targetEl.classList.remove('vtt-textarea-highlight');
+            hintEl.classList.remove('vtt-visible');
+            targetEl.removeEventListener('focus', dismissHint);
+          });
+        }
       }
     }
 
