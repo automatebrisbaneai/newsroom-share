@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -15,6 +16,28 @@ PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
 PB_NEWS_EMAIL = os.environ.get("PB_NEWS_ADMIN_EMAIL", os.environ.get("PB_ADMIN_EMAIL", ""))
 PB_NEWS_PASSWORD = os.environ.get("PB_NEWS_ADMIN_PASSWORD", os.environ.get("PB_ADMIN_PASSWORD", ""))
 CLEAN_MODEL = "deepseek/deepseek-v3.2"
+
+
+def _load_croquet_dictionary() -> dict:
+    """Load croquet-dictionary.json from shared/ — tries app dir first, then parent."""
+    for base in (Path(__file__).parent, Path(__file__).parent.parent):
+        p = base / "shared" / "croquet-dictionary.json"
+        if p.is_file():
+            return json.loads(p.read_text(encoding="utf-8"))
+    return {"terms": [], "players": []}
+
+
+_DICTIONARY = _load_croquet_dictionary()
+_DICTIONARY_HINT = (
+    "The following are valid croquet terms that may appear in the transcript — "
+    "correct any misheard words to match these exactly: "
+    + ", ".join(_DICTIONARY.get("terms", []))
+    + ". "
+    "The following are Queensland croquet player names — "
+    "correct any misheard names to match these exactly: "
+    + ", ".join(_DICTIONARY.get("players", []))
+    + ". "
+) if (_DICTIONARY.get("terms") or _DICTIONARY.get("players")) else ""
 
 _pb_token: str = ""
 
@@ -98,7 +121,8 @@ async def clean_transcript(req: TranscriptRequest):
             "messages": [{
                 "role": "user",
                 "content": (
-                    "Clean up this voice transcript into readable, properly punctuated text. "
+                    _DICTIONARY_HINT
+                    + "Clean up this voice transcript into readable, properly punctuated text. "
                     "The input has no punctuation — you must add it. "
                     "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
                     "Remove filler words (um, uh, like, you know, sort of). "
