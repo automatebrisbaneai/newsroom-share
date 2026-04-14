@@ -212,33 +212,6 @@
       justify-content: space-between;
       margin-bottom: 8px;
     }
-    .voice-btn {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      border: 1.5px solid var(--border);
-      background: white;
-      color: var(--muted-fg);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      -webkit-tap-highlight-color: transparent;
-      transition: background 0.15s, border-color 0.15s, color 0.15s;
-      flex-shrink: 0;
-    }
-    .voice-btn:active { background: var(--muted); }
-    .voice-btn.recording {
-      background: #fef2f2;
-      border-color: #dc2626;
-      color: #dc2626;
-      animation: recordPulse 1.4s ease-in-out infinite;
-    }
-    .voice-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    @keyframes recordPulse {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.15); }
-      50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0.08); }
-    }
     .voice-label {
       font-size: 0.65rem;
       color: var(--muted-fg);
@@ -251,33 +224,6 @@
       color: var(--muted-fg);
       margin-top: 6px;
       min-height: 14px;
-    }
-
-    /* ── Interim blur display ── */
-    #interim {
-      display: none;
-      width: 100%;
-      margin-top: 8px;
-      padding: 11px 13px;
-      font-size: 0.95rem;
-      font-family: inherit;
-      border: 1.5px solid #dc2626;
-      border-radius: 8px;
-      background: white;
-      color: var(--foreground);
-      min-height: 90px;
-      line-height: 1.55;
-      word-wrap: break-word;
-    }
-    #interim .blurred {
-      filter: blur(5px);
-      opacity: 0.55;
-      color: var(--muted-fg);
-      user-select: none;
-    }
-    #interim .clear {
-      filter: none;
-      opacity: 1;
     }
 
     /* ── Form fields ── */
@@ -510,6 +456,7 @@
     <button class="another-btn" id="anotherBtn" type="button">Submit another</button>
   </div>
 
+  <script src="/shared/voice-to-text.js"></script>
   <script>
   // ── Media capture ──────────────────────────────────────────────────────────
 
@@ -612,155 +559,13 @@
     galleryInput.value = '';
   });
 
-  // ── Voice transcription ────────────────────────────────────────────────────
-
-  const voiceBtn    = document.getElementById('voiceBtn');
-  const voiceLabel  = document.getElementById('voiceLabel');
-  const voiceStatus = document.getElementById('voiceStatus');
-  const captionField = document.getElementById('captionField');
-  const interimEl   = document.getElementById('interim');
-
-  let recognition  = null;
-  let isRecording  = false;
-  let accumulated  = '';   // finals from previous Android restarts
-  let sessionFinal = '';   // finals from current recognition session
-  let preVoice     = '';   // what was in the textarea before we started
-  let wakeLock     = null;
-
-  const MIC_SVG  = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>`;
-  const STOP_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
-
-  function setInterimText(text) {
-    const words = text.trim().split(/\s+/).filter(Boolean);
-    if (!words.length) { interimEl.innerHTML = ''; return; }
-    const fadeWords = 6;
-    const levels = [
-      { blur: 0,   opacity: 1.0  },
-      { blur: 0.5, opacity: 0.9  },
-      { blur: 1.5, opacity: 0.78 },
-      { blur: 2.5, opacity: 0.65 },
-      { blur: 3.5, opacity: 0.52 },
-      { blur: 4.5, opacity: 0.42 },
-    ];
-    if (words.length <= fadeWords) {
-      interimEl.innerHTML = words.map((w, i) => {
-        const pos = words.length - 1 - i;
-        const lvl = levels[Math.min(pos, levels.length - 1)];
-        return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${w}</span>`;
-      }).join(' ');
-    } else {
-      const blurred = words.slice(0, -fadeWords).join(' ');
-      const fading = words.slice(-fadeWords).map((w, i) => {
-        const pos = fadeWords - 1 - i;
-        const lvl = levels[Math.min(pos, levels.length - 1)];
-        return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${w}</span>`;
-      }).join(' ');
-      interimEl.innerHTML = `<span class="blurred">${blurred}</span> ${fading}`;
-    }
-  }
-
-  function setCaption(voiceText) {
-    captionField.value = preVoice
-      ? preVoice.trimEnd() + '\n\n' + voiceText
-      : voiceText;
-  }
-
-  function initRecognition() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      voiceStatus.textContent = 'Speech recognition not supported — use Chrome or Safari.';
-      voiceBtn.disabled = true;
-      return false;
-    }
-    recognition = new SR();
-    recognition.continuous     = true;
-    recognition.interimResults = true;
-    recognition.lang           = 'en-AU';
-
-    recognition.onresult = (event) => {
-      sessionFinal = '';
-      let interim  = '';
-      for (let i = 0; i < event.results.length; i++) {
-        if (event.results[i].isFinal) sessionFinal += event.results[i][0].transcript + ' ';
-        else interim += event.results[i][0].transcript;
-      }
-      const fullText = accumulated + sessionFinal + interim;
-      setCaption(fullText);
-      setInterimText(fullText);
-    };
-
-    recognition.onerror = (e) => {
-      if (e.error === 'no-speech') return;
-      voiceStatus.textContent = 'Error: ' + e.error;
-      stopVoice(false);
-    };
-
-    recognition.onend = () => {
-      if (isRecording) {
-        accumulated  += sessionFinal;
-        sessionFinal  = '';
-        recognition.start();
-      }
-    };
-    return true;
-  }
-
-  async function startVoice() {
-    if (!recognition && !initRecognition()) return;
-    preVoice     = captionField.value;
-    accumulated  = '';
-    sessionFinal = '';
-    isRecording  = true;
-    if ('wakeLock' in navigator) {
-      try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
-    }
-    voiceBtn.classList.add('recording');
-    voiceBtn.innerHTML      = STOP_SVG;
-    voiceLabel.textContent  = 'Tap to stop';
-    voiceStatus.textContent = 'Listening…';
-    captionField.style.display = 'none';
-    interimEl.style.display = 'block';
-    interimEl.innerHTML     = '';
-    recognition.start();
-  }
-
-  async function stopVoice(clean = true) {
-    isRecording = false;
-    if (wakeLock) { wakeLock.release(); wakeLock = null; }
-    if (recognition) recognition.stop();
-    voiceBtn.classList.remove('recording');
-    voiceBtn.innerHTML     = MIC_SVG;
-    voiceLabel.textContent = 'Talk to text';
-    interimEl.style.display    = 'none';
-    captionField.style.display = '';
-
-    const raw = (accumulated + sessionFinal).trim();
-    if (!clean || !raw) {
-      if (clean) voiceStatus.textContent = 'Nothing heard — try again.';
-      return;
-    }
-
-    voiceStatus.textContent = 'Tidying up…';
-    voiceBtn.disabled = true;
-    try {
-      const res  = await fetch('/clean', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ text: raw }),
-      });
-      const data = await res.json();
-      setCaption(data.cleaned || raw);
-      voiceStatus.textContent = '';
-    } catch {
-      // /clean failed — raw transcript is already in the textarea, leave it
-      voiceStatus.textContent = '';
-    } finally {
-      voiceBtn.disabled = false;
-    }
-  }
-
-  voiceBtn.addEventListener('click', () => {
-    isRecording ? stopVoice() : startVoice();
+  // ── Voice transcription (shared template) ──────────────────────────────────
+  VoiceToText.init({
+    target:  'captionField',
+    button:  'voiceBtn',
+    interim: 'interim',
+    status:  'voiceStatus',
+    label:   'voiceLabel',
   });
 
   // ── Submit ─────────────────────────────────────────────────────────────────
