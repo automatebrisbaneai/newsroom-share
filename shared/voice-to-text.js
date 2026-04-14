@@ -78,6 +78,20 @@
         0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.15); }
         50%       { box-shadow: 0 0 0 5px rgba(220,38,38,0.08); }
       }
+      .vtt-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #73182C;
+        margin-left: 5px;
+        vertical-align: middle;
+        animation: vttDotPulse 1.6s ease-in-out infinite;
+      }
+      @keyframes vttDotPulse {
+        0%, 100% { opacity: 0.35; transform: scale(0.85); }
+        50%      { opacity: 1;    transform: scale(1.1);  }
+      }
     `;
     document.head.appendChild(style);
   }
@@ -97,16 +111,19 @@
     { blur: 4.5, opacity: 0.42 },
   ];
 
-  function setInterimText(el, text) {
+  const DOT = '<span class="vtt-dot"></span>';
+
+  function setInterimText(el, text, showDot) {
     const words = text.trim().split(/\s+/).filter(Boolean);
     if (!words.length) { el.innerHTML = ''; return; }
+    const dot = showDot !== false ? DOT : '';
 
     if (words.length <= FADE_WORDS) {
       el.innerHTML = words.map((w, i) => {
         const pos = words.length - 1 - i;
         const lvl = LEVELS[Math.min(pos, LEVELS.length - 1)];
         return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${esc(w)}</span>`;
-      }).join(' ');
+      }).join(' ') + dot;
     } else {
       const blurred = words.slice(0, -FADE_WORDS).map(esc).join(' ');
       const fading = words.slice(-FADE_WORDS).map((w, i) => {
@@ -114,7 +131,7 @@
         const lvl = LEVELS[Math.min(pos, LEVELS.length - 1)];
         return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${esc(w)}</span>`;
       }).join(' ');
-      el.innerHTML = `<span class="vtt-blurred">${blurred}</span> ${fading}`;
+      el.innerHTML = `<span class="vtt-blurred">${blurred}</span> ${fading}${dot}`;
     }
   }
 
@@ -238,15 +255,17 @@
       btnEl.classList.remove('vtt-recording');
       btnEl.innerHTML = MIC_SVG;
       if (labelEl)  labelEl.textContent  = 'Talk to text';
-      interimEl.style.display = 'none';
-      targetEl.style.display  = '';
 
       const raw = (accumulated + sessionFinal).trim();
       if (!clean || !raw) {
+        interimEl.style.display = 'none';
+        targetEl.style.display  = '';
         if (clean && statusEl) statusEl.textContent = 'Nothing heard \u2014 try again.';
         return;
       }
 
+      // Keep blur visible with dot while processing
+      setInterimText(interimEl, raw, true);
       if (statusEl) statusEl.textContent = 'Tidying up\u2026';
       btnEl.disabled = true;
       try {
@@ -261,6 +280,9 @@
       } catch {
         if (statusEl) statusEl.textContent = '';
       } finally {
+        // Now reveal the clean text
+        interimEl.style.display = 'none';
+        targetEl.style.display  = '';
         btnEl.disabled = false;
       }
     }
