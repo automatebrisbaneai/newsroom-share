@@ -588,6 +588,9 @@
   const progressFill = document.getElementById('progressFill');
   const progressText = document.getElementById('progressText');
 
+  if (localStorage.getItem('share_name'))  nameField.value  = localStorage.getItem('share_name');
+  if (localStorage.getItem('share_event')) eventField.value = localStorage.getItem('share_event');
+
   submitBtn.addEventListener('click', async () => {
     submitError.textContent = '';
     const name = nameField.value.trim();
@@ -647,6 +650,8 @@
         xhr.send(fd);
       });
 
+      localStorage.setItem('share_name',  name);
+      localStorage.setItem('share_event', eventField.value.trim());
       mainForm.style.display    = 'none';
       successScreen.style.display = 'flex';
       window.scrollTo(0, 0);
@@ -664,8 +669,8 @@
     selectedFiles = [];
     renderGrid();
     captionField.value          = '';
-    nameField.value             = '';
-    eventField.value            = '';
+    nameField.value             = localStorage.getItem('share_name')  || '';
+    eventField.value            = localStorage.getItem('share_event') || '';
     voiceStatus.textContent     = '';
     submitError.textContent     = '';
     submitBtn.disabled          = false;
