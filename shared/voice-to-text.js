@@ -231,7 +231,9 @@
         }
         const fullText = accumulated + sessionFinal + interim;
         setCaption(fullText);
-        setInterimText(interimEl, fullText);
+        // Show previous text blurred with new words clear at the end
+        const displayText = preVoice ? preVoice.trimEnd() + ' ' + fullText : fullText;
+        setInterimText(interimEl, displayText);
       };
 
       recognition.onerror = (e) => {
@@ -267,7 +269,12 @@
       targetEl.classList.remove('vtt-textarea-highlight');
       targetEl.style.display  = 'none';
       interimEl.style.display = 'block';
-      interimEl.innerHTML     = '';
+      // Show existing text blurred so it feels like a continuation
+      if (preVoice.trim()) {
+        setInterimText(interimEl, preVoice, true);
+      } else {
+        interimEl.innerHTML = '';
+      }
       recognition.start();
     }
 
