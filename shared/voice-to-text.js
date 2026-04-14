@@ -263,17 +263,30 @@
         if (isRecording) {
           accumulated  += sessionFinal;
           sessionFinal  = '';
-          recognition.start();
+          try {
+            recognition.start();
+          } catch {
+            // Recognition is in a bad state (e.g. tab backgrounded, InvalidStateError).
+            // Clean up gracefully rather than leaving isRecording true with dead recognition.
+            stopVoice(false);
+          }
         }
       };
       return true;
     }
 
     async function startVoice() {
+      // Disable the button immediately to prevent a double-tap race condition.
+      // If the user taps twice quickly, the second tap arrives while this
+      // function is suspended at the wakeLock await. Without this guard the
+      // second tap calls stopVoice(), then the first tap resumes and calls
+      // recognition.start() on a stopped object — zombie state.
+      btnEl.disabled = true;
+
       // Always recreate the recognition object on each new session so stale
       // state from a previous session (or an audio-session interruption from
       // the file picker) can't corrupt this one.
-      if (!initRecognition()) return;
+      if (!initRecognition()) { btnEl.disabled = false; return; }
       preVoice     = targetEl.value;
       accumulated  = '';
       sessionFinal = '';
@@ -281,6 +294,11 @@
       if ('wakeLock' in navigator) {
         try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
       }
+
+      // Guard: if stopVoice() was called while we were awaiting wakeLock,
+      // isRecording will have been set to false. Abort the start sequence.
+      if (!isRecording) { btnEl.disabled = false; return; }
+
       btnEl.classList.add('vtt-recording');
       btnEl.innerHTML = STOP_SVG;
       if (labelEl)  labelEl.textContent  = 'Tap to stop';
@@ -296,6 +314,7 @@
         interimEl.innerHTML = '';
       }
       recognition.start();
+      btnEl.disabled = false;
     }
 
     async function stopVoice(clean) {
