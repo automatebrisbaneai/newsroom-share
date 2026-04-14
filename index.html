@@ -528,6 +528,9 @@
         if (files.length) addFiles(files);
         addInput.value = '';
       });
+      addInput.addEventListener('click', () => {
+        if (voiceControl && voiceControl.isRecording()) voiceControl.stop();
+      });
 
       const addTile = document.createElement('label');
       addTile.className = 'thumb-add';
@@ -560,12 +563,17 @@
   });
 
   // ── Voice transcription (shared template) ──────────────────────────────────
-  VoiceToText.init({
+  const voiceControl = VoiceToText.init({
     target:  'captionField',
     button:  'voiceBtn',
     interim: 'interim',
     status:  'voiceStatus',
     label:   'voiceLabel',
+  });
+
+  // Stop voice before gallery picker opens — iOS won't share the audio session
+  document.getElementById('galleryInput').addEventListener('click', () => {
+    if (voiceControl.isRecording()) voiceControl.stop();
   });
 
   // ── Submit ─────────────────────────────────────────────────────────────────
