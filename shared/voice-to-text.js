@@ -217,6 +217,20 @@
         btnEl.disabled = true;
         return false;
       }
+
+      // Tear down any existing recognition object before creating a fresh one.
+      // Reusing the same object across multiple start/stop cycles (especially
+      // after an audio-session interruption from the file picker) leaves the
+      // object in a broken state where onend fires at unexpected times and
+      // recognition.start() silently fails. Always start fresh.
+      if (recognition) {
+        recognition.onresult = null;
+        recognition.onerror  = null;
+        recognition.onend    = null;
+        try { recognition.abort(); } catch {}
+        recognition = null;
+      }
+
       recognition = new SR();
       recognition.continuous     = true;
       recognition.interimResults = true;
@@ -238,7 +252,10 @@
 
       recognition.onerror = (e) => {
         if (e.error === 'no-speech') return;
-        if (statusEl) statusEl.textContent = 'Error: ' + e.error;
+        const msg = e.error.toLowerCase().includes('call') || e.error === 'not-allowed'
+          ? 'Mic busy — close other apps using audio and try again'
+          : 'Error: ' + e.error;
+        if (statusEl) statusEl.textContent = msg;
         stopVoice(false);
       };
 
@@ -253,7 +270,10 @@
     }
 
     async function startVoice() {
-      if (!recognition && !initRecognition()) return;
+      // Always recreate the recognition object on each new session so stale
+      // state from a previous session (or an audio-session interruption from
+      // the file picker) can't corrupt this one.
+      if (!initRecognition()) return;
       preVoice     = targetEl.value;
       accumulated  = '';
       sessionFinal = '';
@@ -282,7 +302,15 @@
       if (clean === undefined) clean = true;
       isRecording = false;
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
-      if (recognition) recognition.stop();
+      if (recognition) {
+        // Detach handlers before stopping so a delayed onend from this stop()
+        // call cannot trigger an unwanted restart or corrupt a new session
+        // that starts immediately after (e.g. rapid tap, or file picker close).
+        recognition.onresult = null;
+        recognition.onerror  = null;
+        recognition.onend    = null;
+        try { recognition.stop(); } catch {}
+      }
       btnEl.classList.remove('vtt-recording');
       btnEl.innerHTML = MIC_SVG;
       if (labelEl)  labelEl.textContent  = 'Talk to text';
