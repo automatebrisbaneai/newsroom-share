@@ -87,15 +87,19 @@
       margin-bottom: 12px;
     }
 
-    /* ── Empty-state add button ── */
+    /* ── Empty-state add buttons ── */
+    .capture-row {
+      display: flex;
+      gap: 8px;
+    }
     .capture-btn {
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       gap: 8px;
-      width: 100%;
-      padding: 28px 16px;
+      flex: 1;
+      padding: 22px 12px;
       background: var(--muted);
       border: 1.5px dashed var(--border);
       border-radius: 10px;
@@ -388,18 +392,30 @@
         <!-- Thumbnail grid (hidden until files selected) -->
         <div class="media-grid" id="mediaGrid"></div>
 
-        <!-- Empty-state add button — input overlaid directly so Chrome respects multiple -->
-        <label class="capture-btn" id="cameraBtn" for="galleryInput">
-          <div class="capture-icon">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-              <circle cx="12" cy="13" r="4"/>
-            </svg>
-          </div>
-          <div class="capture-title">Add Photos or Videos</div>
-          <div class="capture-sub">Camera or gallery</div>
-          <input id="galleryInput" type="file" accept="image/*,video/*" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
-        </label>
+        <!-- Two buttons: Camera (single capture) + Gallery (multi-select) -->
+        <div class="capture-row" id="captureRow">
+          <label class="capture-btn" for="cameraInput">
+            <div class="capture-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+            </div>
+            <div class="capture-title">Camera</div>
+            <input id="cameraInput" type="file" accept="image/*,video/*" capture="environment" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
+          </label>
+          <label class="capture-btn" for="galleryInput">
+            <div class="capture-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="4" width="20" height="16" rx="2"/>
+                <circle cx="9" cy="11" r="3"/>
+                <path d="M21 15l-3.5-3.5a2 2 0 0 0-2.83 0L7 19"/>
+              </svg>
+            </div>
+            <div class="capture-title">Gallery</div>
+            <input id="galleryInput" type="file" accept="image/*,video/*" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
+          </label>
+        </div>
       </div>
 
       <!-- Caption + voice -->
@@ -460,13 +476,12 @@
   <script>
   // ── Media capture ──────────────────────────────────────────────────────────
 
-  const cameraBtn    = document.getElementById('cameraBtn');
+  const captureRow   = document.getElementById('captureRow');
+  const cameraInput  = document.getElementById('cameraInput');
   const galleryInput = document.getElementById('galleryInput');
   const mediaGrid    = document.getElementById('mediaGrid');
 
   let selectedFiles = [];  // array of { file, objectUrl }
-
-  // cameraBtn is now a <label for="galleryInput"> — no JS click handler needed
 
   function renderGrid() {
     // Revoke old URLs handled individually on remove
@@ -546,7 +561,7 @@
 
     const hasFiles = selectedFiles.length > 0;
     mediaGrid.classList.toggle('has-files', hasFiles);
-    cameraBtn.style.display = hasFiles ? 'none' : '';
+    captureRow.style.display = hasFiles ? 'none' : '';
   }
 
   function addFiles(newFiles) {
@@ -555,6 +570,12 @@
     }
     renderGrid();
   }
+
+  cameraInput.addEventListener('change', () => {
+    const files = Array.from(cameraInput.files || []);
+    if (files.length) addFiles(files);
+    cameraInput.value = '';
+  });
 
   galleryInput.addEventListener('change', () => {
     const files = Array.from(galleryInput.files || []);
@@ -571,7 +592,10 @@
     label:   'voiceLabel',
   });
 
-  // Stop voice before gallery picker opens — iOS won't share the audio session
+  // Stop voice before file picker opens — iOS won't share the audio session
+  document.getElementById('cameraInput').addEventListener('click', () => {
+    if (voiceControl.isRecording()) voiceControl.stop();
+  });
   document.getElementById('galleryInput').addEventListener('click', () => {
     if (voiceControl.isRecording()) voiceControl.stop();
   });

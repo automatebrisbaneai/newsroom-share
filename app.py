@@ -188,7 +188,7 @@ async def submit(
     try:
         token = get_token()
         r = _post_record(token, fields, file_parts)
-        if r.status_code == 401:
+        if r.status_code in (401, 403):
             token = refresh_token()
             r = _post_record(token, fields, file_parts)
         if not r.ok:
