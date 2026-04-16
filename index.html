@@ -323,6 +323,29 @@
       margin-top: 4px;
     }
 
+    /* ── Size cap caption ── */
+    .file-size-cap {
+      display: block;
+      font-size: 0.72rem;
+      color: var(--muted-fg);
+      text-align: center;
+      margin-top: 8px;
+    }
+
+    /* ── Inline size error ── */
+    .size-error {
+      display: none;
+      font-size: 0.82rem;
+      color: #dc2626;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 8px;
+      line-height: 1.45;
+    }
+    .size-error.visible { display: block; }
+
     /* ── Success screen ── */
     #successScreen {
       display: none;
@@ -405,6 +428,8 @@
             <input id="fileInput" type="file" accept="image/*,video/*" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
           </label>
         </div>
+        <span class="file-size-cap" id="fileSizeCap">Up to 1GB per submission. Photos or videos.</span>
+        <div class="size-error" id="sizeError"></div>
       </div>
 
       <!-- Caption + voice -->
@@ -552,11 +577,40 @@
     captureRow.style.display = hasFiles ? 'none' : '';
   }
 
+  // ── Size check constants ───────────────────────────────────────────────────
+  const MAX_BYTES = 1073741824; // 1 GB
+
+  function totalSelectedBytes() {
+    return selectedFiles.reduce((sum, { file }) => sum + file.size, 0);
+  }
+
+  function formatBytes(bytes) {
+    if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + 'GB';
+    if (bytes >= 1048576)    return (bytes / 1048576).toFixed(0) + 'MB';
+    return (bytes / 1024).toFixed(0) + 'KB';
+  }
+
+  const sizeError = document.getElementById('sizeError');
+
+  function checkSizeLimit() {
+    const total = totalSelectedBytes();
+    if (total > MAX_BYTES) {
+      sizeError.textContent =
+        `Your selection totals ${formatBytes(total)}. The limit is 1GB per submission — please remove some or trim a video.`;
+      sizeError.classList.add('visible');
+      return false;
+    }
+    sizeError.classList.remove('visible');
+    sizeError.textContent = '';
+    return true;
+  }
+
   function addFiles(newFiles) {
     for (const file of newFiles) {
       selectedFiles.push({ file, objectUrl: URL.createObjectURL(file) });
     }
     renderGrid();
+    checkSizeLimit();
   }
 
   fileInput.addEventListener('change', () => {
@@ -600,7 +654,20 @@
   // is reused — the server returns the existing record instead of creating a duplicate.
   let submissionUuid = crypto.randomUUID();
 
+  // Guards against double-tap: set true when submit is in flight, reset on error.
+  let _submitting = false;
+
   submitBtn.addEventListener('click', async () => {
+    // Belt-and-braces size check on submit (catches edge case where files were added
+    // via "add more" tile without triggering the onChange check).
+    if (!checkSizeLimit()) {
+      sizeError.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      return;
+    }
+
+    // Double-tap guard — if already submitting, do nothing.
+    if (_submitting) return;
+
     submitError.textContent = '';
     const name = nameField.value.trim();
     if (!name) {
@@ -614,8 +681,19 @@
       return;
     }
 
+    // Disable button immediately — any second tap now hits the _submitting guard.
+    _submitting           = true;
     submitBtn.disabled    = true;
     submitBtn.textContent = 'Sending…';
+
+    // Show progress bar right away.
+    progressWrap.style.display = 'block';
+    progressFill.style.width   = '0%';
+    progressFill.classList.remove('pulsing');
+    progressText.textContent   = 'Uploading… 0%';
+
+    // Timer reference for the "large uploads can take a moment" reassurance.
+    let _at90Timer = null;
 
     try {
       const fd = new FormData();
@@ -628,27 +706,33 @@
       await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/submit');
-        progressWrap.style.display = 'block';
-        progressFill.style.width = '0%';
-        progressText.textContent = 'Uploading…';
 
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable) {
-            const pct = Math.round((e.loaded / e.total) * 90);
+            const pct = Math.round((e.loaded / e.total) * 89);
             progressFill.style.width = pct + '%';
             progressText.textContent = `Uploading… ${pct}%`;
           }
         };
 
         xhr.upload.onloadend = () => {
+          // Upload bytes are sent — server is now processing.
+          if (_at90Timer) clearTimeout(_at90Timer);
           progressFill.style.width = '90%';
-          progressFill.classList.add('pulsing');
-          progressText.textContent = 'Processing…';
+          progressFill.classList.remove('pulsing');
+          progressText.textContent = 'Sending to newsroom servers…';
+          // After 15 s at 90%, append a reassurance note.
+          _at90Timer = setTimeout(() => {
+            if (progressText.textContent.startsWith('Sending to newsroom servers')) {
+              progressText.textContent = 'Sending to newsroom servers… (large uploads can take a moment)';
+            }
+          }, 15000);
         };
 
         xhr.onload = () => {
+          if (_at90Timer) { clearTimeout(_at90Timer); _at90Timer = null; }
           // 200 OK or 409 Conflict (duplicate UUID = original got through) both count as success.
-          if (xhr.status >= 200 && xhr.status < 300 || xhr.status === 409) {
+          if ((xhr.status >= 200 && xhr.status < 300) || xhr.status === 409) {
             progressFill.classList.remove('pulsing');
             progressFill.style.width = '100%';
             progressText.textContent = '';
@@ -657,7 +741,10 @@
             reject(new Error(xhr.responseText || 'Submission failed.'));
           }
         };
-        xhr.onerror = () => reject(new Error('Network error — please try again.'));
+        xhr.onerror = () => {
+          if (_at90Timer) { clearTimeout(_at90Timer); _at90Timer = null; }
+          reject(new Error('Network error — please try again.'));
+        };
         xhr.send(fd);
       });
 
@@ -665,14 +752,18 @@
       localStorage.setItem('share_event', eventField.value.trim());
       // Rotate UUID — next submission must be treated as a new, distinct submission.
       submissionUuid = crypto.randomUUID();
-      mainForm.style.display    = 'none';
+      // Show success immediately — don't wait for any animation.
+      mainForm.style.display      = 'none';
       successScreen.style.display = 'flex';
       window.scrollTo(0, 0);
     } catch (e) {
-      submitError.textContent = e.message || 'Something went wrong — please try again.';
-      submitBtn.disabled      = false;
-      submitBtn.textContent   = 'Send to Newsroom';
+      if (_at90Timer) { clearTimeout(_at90Timer); _at90Timer = null; }
+      submitError.textContent    = e.message || 'Something went wrong — please try again.';
+      _submitting                = false;
+      submitBtn.disabled         = false;
+      submitBtn.textContent      = 'Send to Newsroom';
       progressWrap.style.display = 'none';
+      progressFill.style.width   = '0%';
       progressFill.classList.remove('pulsing');
       // Do NOT rotate submissionUuid on failure — the next retry uses the same UUID.
     }
@@ -687,6 +778,9 @@
     eventField.value            = localStorage.getItem('share_event') || '';
     voiceStatus.textContent     = '';
     submitError.textContent     = '';
+    sizeError.classList.remove('visible');
+    sizeError.textContent       = '';
+    _submitting                 = false;
     submitBtn.disabled          = false;
     submitBtn.textContent       = 'Send to Newsroom';
     progressWrap.style.display  = 'none';
