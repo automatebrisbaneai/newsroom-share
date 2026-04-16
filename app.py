@@ -2,18 +2,27 @@ import json
 import os
 import re
 import tempfile
+import time
 import uuid as uuid_lib
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response as FastAPIResponse
 from pydantic import BaseModel
 from pathlib import Path
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+
+from logging_config import configure_logging, get_logger, REQUEST_ID
+
+# ---------------------------------------------------------------------------
+# Logging — configure before first use so startup messages are structured too.
+# ---------------------------------------------------------------------------
+configure_logging()
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Rate limiter (Phase 0 — per-IP caps via slowapi)
@@ -54,15 +63,105 @@ async def lifespan(application: FastAPI):
     """Create a shared httpx.AsyncClient for the app lifetime."""
     client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
     application.state.http = client
+    logger.info("Application startup", extra={"event": "app_startup"})
     try:
         yield
     finally:
         await client.aclose()
+        logger.info("Application shutdown", extra={"event": "app_shutdown"})
 
 
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Request correlation ID middleware
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    """
+    Assign a correlation ID to every request.
+
+    - Honour X-Request-ID if a reverse proxy has already set one.
+    - Otherwise generate a short UUID (12 hex chars — readable in logs).
+    - Store in REQUEST_ID ContextVar so every log line in this request picks
+      it up automatically.
+    - Return the ID in the X-Request-ID response header so clients/upstreams
+      can correlate their own logs.
+    """
+    request_id = request.headers.get("x-request-id") or uuid_lib.uuid4().hex[:12]
+    token = REQUEST_ID.set(request_id)
+
+    path = request.url.path
+    method = request.method
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+
+    t_start = time.monotonic()
+    logger.info(
+        "Request start",
+        extra={
+            "event": "request_start",
+            "path": path,
+            "method": method,
+            "client_ip": client_ip,
+        },
+    )
+
+    try:
+        response = await call_next(request)
+        duration_ms = round((time.monotonic() - t_start) * 1000)
+        logger.info(
+            "Request end",
+            extra={
+                "event": "request_end",
+                "path": path,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        duration_ms = round((time.monotonic() - t_start) * 1000)
+        logger.error(
+            "Request error",
+            extra={
+                "event": "request_end",
+                "path": path,
+                "status": 500,
+                "duration_ms": duration_ms,
+            },
+        )
+        raise
+    finally:
+        REQUEST_ID.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Global exception handler — structured ERROR log before 500 reply
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        "Unhandled exception",
+        extra={
+            "event": "exception",
+            "exc_type": type(exc).__name__,
+            "exc_msg": str(exc),
+            "path": request.url.path,
+        },
+        exc_info=True,
+    )
+    return FastAPIResponse(
+        content=json.dumps({"detail": "An unexpected error occurred."}),
+        status_code=500,
+        media_type="application/json",
+    )
 
 
 def _load_croquet_dictionary() -> dict:
@@ -103,12 +202,20 @@ async def _auth(client: httpx.AsyncClient) -> str:
 async def get_token(client: httpx.AsyncClient) -> str:
     global _pb_token
     if not _pb_token:
+        logger.info(
+            "PocketBase auth — obtaining token",
+            extra={"event": "pb_auth_refresh", "reason": "no_token"},
+        )
         _pb_token = await _auth(client)
     return _pb_token
 
 
 async def refresh_token(client: httpx.AsyncClient) -> str:
     global _pb_token
+    logger.info(
+        "PocketBase auth — refreshing expired token",
+        extra={"event": "pb_auth_refresh", "reason": "token_expired_or_rejected"},
+    )
     _pb_token = await _auth(client)
     return _pb_token
 
@@ -177,7 +284,15 @@ async def shared_file(filename: str):
 @limiter.limit("100/day")
 async def clean_transcript(request: Request, req: TranscriptRequest):
     client: httpx.AsyncClient = request.app.state.http
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    t_start = time.monotonic()
+    input_chars = len(req.text)
+
     try:
+        t_or_start = time.monotonic()
         res = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
@@ -205,15 +320,73 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                 "max_tokens": 4096,
             },
         )
+        or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
         data = res.json()
+
         if "choices" not in data:
-            print(f"[clean] OpenRouter error response: {data}")
+            logger.error(
+                "OpenRouter returned error response",
+                extra={
+                    "event": "openrouter_clean",
+                    "status_code": res.status_code,
+                    "duration_ms": or_duration_ms,
+                    "input_chars": input_chars,
+                    "output_chars": 0,
+                    "error": str(data),
+                    "client_ip": client_ip,
+                },
+            )
+            duration_ms = round((time.monotonic() - t_start) * 1000)
+            logger.warning(
+                "Clean failed — openrouter_error",
+                extra={
+                    "event": "clean_failure",
+                    "duration_ms": duration_ms,
+                    "failure_reason": "openrouter_error",
+                },
+            )
             raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
-        return {"cleaned": data["choices"][0]["message"]["content"]}
+
+        cleaned = data["choices"][0]["message"]["content"]
+        output_chars = len(cleaned)
+        or_duration_ms = round((time.monotonic() - t_or_start) * 1000)
+
+        logger.info(
+            "OpenRouter clean succeeded",
+            extra={
+                "event": "openrouter_clean",
+                "status_code": res.status_code,
+                "duration_ms": or_duration_ms,
+                "input_chars": input_chars,
+                "output_chars": output_chars,
+            },
+        )
+        duration_ms = round((time.monotonic() - t_start) * 1000)
+        logger.info(
+            "Clean succeeded",
+            extra={
+                "event": "clean_success",
+                "duration_ms": duration_ms,
+                "input_chars": input_chars,
+                "output_chars": output_chars,
+            },
+        )
+        return {"cleaned": cleaned}
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[clean] Unexpected error: {e}")
+        duration_ms = round((time.monotonic() - t_start) * 1000)
+        logger.error(
+            "Clean unexpected error",
+            extra={
+                "event": "clean_failure",
+                "duration_ms": duration_ms,
+                "failure_reason": "internal_error",
+                "exc_type": type(e).__name__,
+                "exc_msg": str(e),
+            },
+        )
         raise HTTPException(status_code=500, detail="Transcript cleaning failed, please try again.")
 
 
@@ -227,12 +400,37 @@ async def submit(
     submission_uuid: Optional[str] = Form(None),
     files: List[UploadFile] = File(default=[]),
 ):
+    t_start = time.monotonic()
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+
     # Phase 0: reject oversized payloads before reading file bytes into RAM.
     # Check Content-Length header first (fast path — client must declare size).
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
-            if int(content_length) > MAX_SUBMIT_BYTES:
+            cl_int = int(content_length)
+            if cl_int > MAX_SUBMIT_BYTES:
+                duration_ms = round((time.monotonic() - t_start) * 1000)
+                logger.warning(
+                    "Submit rejected — payload too large (Content-Length check)",
+                    extra={
+                        "event": "size_cap_rejected",
+                        "content_length": cl_int,
+                        "client_ip": client_ip,
+                    },
+                )
+                logger.warning(
+                    "Submit failed — size_cap",
+                    extra={
+                        "event": "submit_failure",
+                        "duration_ms": duration_ms,
+                        "failure_reason": "size_cap",
+                        "submission_uuid": submission_uuid,
+                    },
+                )
                 raise HTTPException(
                     status_code=413,
                     detail="Payload too large. Maximum total upload size is 1 GB.",
@@ -260,7 +458,6 @@ async def submit(
     slug = f"{slug}-{uuid_lib.uuid4().hex[:8]}"
 
     # Capture client IP and user agent for abuse tracing.
-    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host
     user_agent = request.headers.get("user-agent", "")[:500]
 
     fields = {
@@ -295,6 +492,25 @@ async def submit(
             # Note: we trust the client-declared content_type for now.
             # Byte-level sniffing (python-magic) is deferred to Phase 5.
             if not any(f.content_type.startswith(p) for p in ALLOWED_MIME_PREFIXES):
+                duration_ms = round((time.monotonic() - t_start) * 1000)
+                logger.warning(
+                    "Submit rejected — unsupported MIME type",
+                    extra={
+                        "event": "mime_rejected",
+                        "content_type": f.content_type,
+                        "upload_filename": f.filename,
+                        "client_ip": client_ip,
+                    },
+                )
+                logger.warning(
+                    "Submit failed — mime_rejected",
+                    extra={
+                        "event": "submit_failure",
+                        "duration_ms": duration_ms,
+                        "failure_reason": "mime_rejected",
+                        "submission_uuid": submission_uuid,
+                    },
+                )
                 raise HTTPException(
                     status_code=415,
                     detail=f"Unsupported file type '{f.content_type}'. Only images and videos are accepted.",
@@ -311,6 +527,24 @@ async def submit(
                 total_bytes += len(chunk)
                 # Phase 0: byte-count safety net for chunked transfers.
                 if total_bytes > MAX_SUBMIT_BYTES:
+                    duration_ms = round((time.monotonic() - t_start) * 1000)
+                    logger.warning(
+                        "Submit rejected — payload too large (byte-count check)",
+                        extra={
+                            "event": "size_cap_rejected",
+                            "content_length": total_bytes,
+                            "client_ip": client_ip,
+                        },
+                    )
+                    logger.warning(
+                        "Submit failed — size_cap",
+                        extra={
+                            "event": "submit_failure",
+                            "duration_ms": duration_ms,
+                            "failure_reason": "size_cap",
+                            "submission_uuid": submission_uuid,
+                        },
+                    )
                     raise HTTPException(
                         status_code=413,
                         detail="Payload too large. Maximum total upload size is 1 GB.",
@@ -325,6 +559,7 @@ async def submit(
             else:
                 file_parts.append(("media", (f.filename, tmp, f.content_type)))
 
+        file_count = len(file_parts)
         http_client: httpx.AsyncClient = request.app.state.http
 
         # Phase 2: idempotency check — query PB for an existing record with this UUID.
@@ -339,15 +574,31 @@ async def submit(
             if existing.status_code == 200:
                 items = existing.json().get("items", [])
                 if items:
-                    print(f"[submit] Idempotency hit — returning existing record {items[0]['id']}")
+                    logger.info(
+                        "Idempotency hit — returning existing record",
+                        extra={
+                            "event": "submit_idempotent_hit",
+                            "submission_uuid": submission_uuid,
+                            "record_id": items[0]["id"],
+                        },
+                    )
                     return {"ok": True, "id": items[0]["id"]}
         except Exception as e:
             # Non-fatal — if the check fails we proceed to create.
             # The PB unique index is the hard backstop.
-            print(f"[submit] Idempotency pre-check error (non-fatal): {e}")
+            logger.warning(
+                "Idempotency pre-check error (non-fatal)",
+                extra={
+                    "event": "submit_idempotency_check_error",
+                    "submission_uuid": submission_uuid,
+                    "exc_type": type(e).__name__,
+                    "exc_msg": str(e),
+                },
+            )
 
         try:
             token = await get_token(http_client)
+            t_pb_start = time.monotonic()
             r = await _post_record(http_client, token, fields, file_parts)
             if r.status_code in (401, 403):
                 token = await refresh_token(http_client)
@@ -355,19 +606,88 @@ async def submit(
                 for _, (_, fh, _) in file_parts:
                     fh.seek(0)
                 r = await _post_record(http_client, token, fields, file_parts)
+            pb_duration_ms = round((time.monotonic() - t_pb_start) * 1000)
+
             if not r.is_success:
                 # PB unique constraint violation on submission_uuid = duplicate submission.
                 # Treat as idempotent success: the first attempt got through.
                 if r.status_code == 400 and "submission_uuid" in r.text:
-                    print(f"[submit] PB unique constraint on submission_uuid — treating as success")
+                    logger.info(
+                        "PB unique constraint on submission_uuid — treating as success",
+                        extra={
+                            "event": "pb_submit",
+                            "status_code": r.status_code,
+                            "submission_uuid": submission_uuid,
+                            "duration_ms": pb_duration_ms,
+                            "total_upload_bytes": total_bytes,
+                            "idempotent_constraint": True,
+                        },
+                    )
                     return {"ok": True, "id": None}
-                print(f"[submit] PocketBase error {r.status_code}: {r.text}")
+
+                logger.error(
+                    "PocketBase error on submit",
+                    extra={
+                        "event": "pb_submit",
+                        "status_code": r.status_code,
+                        "submission_uuid": submission_uuid,
+                        "duration_ms": pb_duration_ms,
+                        "total_upload_bytes": total_bytes,
+                    },
+                )
+                duration_ms = round((time.monotonic() - t_start) * 1000)
+                logger.error(
+                    "Submit failed — pb_error",
+                    extra={
+                        "event": "submit_failure",
+                        "duration_ms": duration_ms,
+                        "failure_reason": "pb_error",
+                        "submission_uuid": submission_uuid,
+                    },
+                )
                 raise HTTPException(status_code=502, detail="Submission failed, please try again.")
-            return {"ok": True, "id": r.json().get("id")}
+
+            record_id = r.json().get("id")
+            logger.info(
+                "PocketBase submit succeeded",
+                extra={
+                    "event": "pb_submit",
+                    "status_code": r.status_code,
+                    "submission_uuid": submission_uuid,
+                    "duration_ms": pb_duration_ms,
+                    "total_upload_bytes": total_bytes,
+                },
+            )
+
+            duration_ms = round((time.monotonic() - t_start) * 1000)
+            logger.info(
+                "Submit succeeded",
+                extra={
+                    "event": "submit_success",
+                    "duration_ms": duration_ms,
+                    "total_upload_bytes": total_bytes,
+                    "file_count": file_count,
+                    "submission_uuid": submission_uuid,
+                    "rate_limit_remaining": None,  # slowapi doesn't expose remaining easily
+                },
+            )
+            return {"ok": True, "id": record_id}
+
         except HTTPException:
             raise
         except Exception as e:
-            print(f"[submit] Unexpected error: {e}")
+            duration_ms = round((time.monotonic() - t_start) * 1000)
+            logger.error(
+                "Submit unexpected error",
+                extra={
+                    "event": "submit_failure",
+                    "duration_ms": duration_ms,
+                    "failure_reason": "internal_error",
+                    "submission_uuid": submission_uuid,
+                    "exc_type": type(e).__name__,
+                    "exc_msg": str(e),
+                },
+            )
             raise HTTPException(status_code=500, detail="Submission failed, please try again.")
     finally:
         # Always close tempfiles — SpooledTemporaryFile deletes disk spill on close.
