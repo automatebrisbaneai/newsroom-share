@@ -594,6 +594,12 @@
   if (localStorage.getItem('share_name'))  nameField.value  = localStorage.getItem('share_name');
   if (localStorage.getItem('share_event')) eventField.value = localStorage.getItem('share_event');
 
+  // Phase 2: client-side idempotency UUID.
+  // Generated fresh on page load. On successful submit we rotate to a new UUID
+  // so the next submission is treated as distinct. On network retry the same UUID
+  // is reused — the server returns the existing record instead of creating a duplicate.
+  let submissionUuid = crypto.randomUUID();
+
   submitBtn.addEventListener('click', async () => {
     submitError.textContent = '';
     const name = nameField.value.trim();
@@ -613,9 +619,10 @@
 
     try {
       const fd = new FormData();
-      fd.append('name',    name);
-      fd.append('event',   eventField.value.trim());
-      fd.append('caption', caption);
+      fd.append('name',            name);
+      fd.append('event',           eventField.value.trim());
+      fd.append('caption',         caption);
+      fd.append('submission_uuid', submissionUuid);
       for (const { file } of selectedFiles) fd.append('files', file);
 
       await new Promise((resolve, reject) => {
@@ -640,7 +647,8 @@
         };
 
         xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
+          // 200 OK or 409 Conflict (duplicate UUID = original got through) both count as success.
+          if (xhr.status >= 200 && xhr.status < 300 || xhr.status === 409) {
             progressFill.classList.remove('pulsing');
             progressFill.style.width = '100%';
             progressText.textContent = '';
@@ -655,6 +663,8 @@
 
       localStorage.setItem('share_name',  name);
       localStorage.setItem('share_event', eventField.value.trim());
+      // Rotate UUID — next submission must be treated as a new, distinct submission.
+      submissionUuid = crypto.randomUUID();
       mainForm.style.display    = 'none';
       successScreen.style.display = 'flex';
       window.scrollTo(0, 0);
@@ -664,6 +674,7 @@
       submitBtn.textContent   = 'Send to Newsroom';
       progressWrap.style.display = 'none';
       progressFill.classList.remove('pulsing');
+      // Do NOT rotate submissionUuid on failure — the next retry uses the same UUID.
     }
   });
 

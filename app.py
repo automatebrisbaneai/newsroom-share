@@ -1,16 +1,16 @@
 import json
 import os
 import re
-import time
+import tempfile
 import uuid as uuid_lib
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from pathlib import Path
-from typing import List
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -115,17 +115,23 @@ async def refresh_token(client: httpx.AsyncClient) -> str:
 
 async def _post_record(client: httpx.AsyncClient, token: str, fields: dict, file_parts: list):
     """Post to the submissions collection (not news_articles).
-    The scoped service account only has createRule on submissions."""
+    The scoped service account only has createRule on submissions.
+
+    file_parts is a list of (field_name, (filename, file_handle, mime)) tuples.
+    file_handle is a seeked-to-0 SpooledTemporaryFile (or any file-like object).
+    httpx streams from the handle without loading it all into RAM.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{PB_NEWS_URL}/api/collections/submissions/records"
     if file_parts:
         # Multipart upload — use per-request extended read timeout for large files.
         files_payload = {}
         data_payload = fields
-        # httpx multipart: files dict maps field name → (filename, content, mime)
-        for idx, (field_name, (filename, content, mime)) in enumerate(file_parts):
+        # httpx multipart: files dict maps field name → (filename, file_handle, mime)
+        # httpx reads from the handle in chunks — no full-buffer in memory.
+        for idx, (field_name, (filename, file_handle, mime)) in enumerate(file_parts):
             key = f"{field_name}_{idx}" if idx > 0 else field_name
-            files_payload[key] = (filename, content, mime)
+            files_payload[key] = (filename, file_handle, mime)
         return await client.post(
             url,
             headers=headers,
@@ -218,6 +224,7 @@ async def submit(
     name: str = Form(...),
     event: str = Form(""),
     caption: str = Form(""),
+    submission_uuid: Optional[str] = Form(None),
     files: List[UploadFile] = File(default=[]),
 ):
     # Phase 0: reject oversized payloads before reading file bytes into RAM.
@@ -239,15 +246,18 @@ async def submit(
     if not name:
         raise HTTPException(status_code=422, detail="Name is required.")
 
+    # Phase 2: use client-provided UUID if present; fall back to server-generated.
+    # Client UUID enables idempotency: a retry with the same UUID returns the
+    # existing record rather than creating a duplicate.
+    if not submission_uuid:
+        submission_uuid = str(uuid_lib.uuid4())
+
     title = f"{event} — from {name}" if event else f"Newsroom submission from {name}"
 
+    # Phase 2: UUID suffix instead of timestamp — eliminates concurrent collisions.
     slug = re.sub(r'[^\w\s-]', '', title.lower())
-    slug = re.sub(r'[\s_-]+', '-', slug).strip('-')[:60]
-    slug = f"{slug}-{int(time.time())}"
-
-    # Phase 1B: generate server-side submission UUID for idempotency pre-wiring.
-    # Phase 2 will wire client-side UUIDs; for now this is server-generated.
-    submission_uuid = str(uuid_lib.uuid4())
+    slug = re.sub(r'[\s_-]+', '-', slug).strip('-')[:55]
+    slug = f"{slug}-{uuid_lib.uuid4().hex[:8]}"
 
     # Capture client IP and user agent for abuse tracing.
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host
@@ -265,54 +275,104 @@ async def submit(
         "status": "pending",
     }
 
-    # Read all files; enforce MIME whitelist and byte-count cap as we go.
+    # Phase 2: stream uploads via SpooledTemporaryFile.
+    # Files up to 10 MB stay in RAM; larger files spill to disk.
+    # We count bytes as we stream so the 1 GB cap is still enforced
+    # even for chunked-transfer requests without a Content-Length header.
+    SPOOL_MEM = 10 * 1024 * 1024  # 10 MB in-memory threshold per file
+
     file_parts: list = []
+    tempfiles: list = []  # keep refs alive until after httpx finishes
     cover_set = False
     total_bytes = 0
-    for f in files:
-        if not f.filename or not f.content_type:
-            continue
 
-        # Phase 0: MIME whitelist — accept image/* and video/* only.
-        # Note: we trust the client-declared content_type for now.
-        # Byte-level sniffing (python-magic) is deferred to Phase 5 — it requires
-        # libmagic on the Docker image which adds build complexity.
-        if not any(f.content_type.startswith(p) for p in ALLOWED_MIME_PREFIXES):
-            raise HTTPException(
-                status_code=415,
-                detail=f"Unsupported file type '{f.content_type}'. Only images and videos are accepted.",
-            )
-
-        content = await f.read()
-
-        # Phase 0: byte-count safety net — catch any payload that slipped past
-        # the Content-Length header check (e.g. chunked transfer).
-        total_bytes += len(content)
-        if total_bytes > MAX_SUBMIT_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail="Payload too large. Maximum total upload size is 1 GB.",
-            )
-
-        if not cover_set and f.content_type.startswith("image/"):
-            file_parts.append(("cover_image", (f.filename, content, f.content_type)))
-            cover_set = True
-        else:
-            file_parts.append(("media", (f.filename, content, f.content_type)))
-
-    client: httpx.AsyncClient = request.app.state.http
     try:
-        token = await get_token(client)
-        r = await _post_record(client, token, fields, file_parts)
-        if r.status_code in (401, 403):
-            token = await refresh_token(client)
-            r = await _post_record(client, token, fields, file_parts)
-        if not r.is_success:
-            print(f"[submit] PocketBase error {r.status_code}: {r.text}")
-            raise HTTPException(status_code=502, detail="Submission failed, please try again.")
-        return {"ok": True, "id": r.json().get("id")}
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[submit] Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="Submission failed, please try again.")
+        for f in files:
+            if not f.filename or not f.content_type:
+                continue
+
+            # Phase 0: MIME whitelist — accept image/* and video/* only.
+            # Note: we trust the client-declared content_type for now.
+            # Byte-level sniffing (python-magic) is deferred to Phase 5.
+            if not any(f.content_type.startswith(p) for p in ALLOWED_MIME_PREFIXES):
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Unsupported file type '{f.content_type}'. Only images and videos are accepted.",
+                )
+
+            # Stream into a SpooledTemporaryFile in 64 KB chunks.
+            tmp = tempfile.SpooledTemporaryFile(max_size=SPOOL_MEM)
+            tempfiles.append(tmp)
+            chunk_size = 64 * 1024  # 64 KB
+            while True:
+                chunk = await f.read(chunk_size)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                # Phase 0: byte-count safety net for chunked transfers.
+                if total_bytes > MAX_SUBMIT_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Payload too large. Maximum total upload size is 1 GB.",
+                    )
+                tmp.write(chunk)
+
+            tmp.seek(0)  # rewind so httpx can read from the start
+
+            if not cover_set and f.content_type.startswith("image/"):
+                file_parts.append(("cover_image", (f.filename, tmp, f.content_type)))
+                cover_set = True
+            else:
+                file_parts.append(("media", (f.filename, tmp, f.content_type)))
+
+        http_client: httpx.AsyncClient = request.app.state.http
+
+        # Phase 2: idempotency check — query PB for an existing record with this UUID.
+        # If found, return it immediately (handles retries + network failures gracefully).
+        try:
+            token = await get_token(http_client)
+            existing = await http_client.get(
+                f"{PB_NEWS_URL}/api/collections/submissions/records",
+                params={"filter": f'(submission_uuid="{submission_uuid}")', "perPage": 1},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if existing.status_code == 200:
+                items = existing.json().get("items", [])
+                if items:
+                    print(f"[submit] Idempotency hit — returning existing record {items[0]['id']}")
+                    return {"ok": True, "id": items[0]["id"]}
+        except Exception as e:
+            # Non-fatal — if the check fails we proceed to create.
+            # The PB unique index is the hard backstop.
+            print(f"[submit] Idempotency pre-check error (non-fatal): {e}")
+
+        try:
+            token = await get_token(http_client)
+            r = await _post_record(http_client, token, fields, file_parts)
+            if r.status_code in (401, 403):
+                token = await refresh_token(http_client)
+                # Rewind all tempfiles before the retry attempt.
+                for _, (_, fh, _) in file_parts:
+                    fh.seek(0)
+                r = await _post_record(http_client, token, fields, file_parts)
+            if not r.is_success:
+                # PB unique constraint violation on submission_uuid = duplicate submission.
+                # Treat as idempotent success: the first attempt got through.
+                if r.status_code == 400 and "submission_uuid" in r.text:
+                    print(f"[submit] PB unique constraint on submission_uuid — treating as success")
+                    return {"ok": True, "id": None}
+                print(f"[submit] PocketBase error {r.status_code}: {r.text}")
+                raise HTTPException(status_code=502, detail="Submission failed, please try again.")
+            return {"ok": True, "id": r.json().get("id")}
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[submit] Unexpected error: {e}")
+            raise HTTPException(status_code=500, detail="Submission failed, please try again.")
+    finally:
+        # Always close tempfiles — SpooledTemporaryFile deletes disk spill on close.
+        for tmp in tempfiles:
+            try:
+                tmp.close()
+            except Exception:
+                pass
