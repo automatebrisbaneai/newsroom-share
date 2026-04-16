@@ -90,7 +90,7 @@
     /* ── Empty-state add buttons ── */
     .capture-row {
       display: flex;
-      gap: 8px;
+      justify-content: center;
     }
     .capture-btn {
       display: flex;
@@ -98,7 +98,7 @@
       align-items: center;
       justify-content: center;
       gap: 8px;
-      flex: 1;
+      width: 100%;
       padding: 22px 12px;
       background: var(--muted);
       border: 1.5px dashed var(--border);
@@ -392,28 +392,17 @@
         <!-- Thumbnail grid (hidden until files selected) -->
         <div class="media-grid" id="mediaGrid"></div>
 
-        <!-- Two buttons: Camera (single capture) + Gallery (multi-select) -->
         <div class="capture-row" id="captureRow">
-          <label class="capture-btn" for="cameraInput">
+          <label class="capture-btn" for="fileInput">
             <div class="capture-icon">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
-                <circle cx="12" cy="13" r="4"/>
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
               </svg>
             </div>
-            <div class="capture-title">Camera</div>
-            <input id="cameraInput" type="file" accept="image/*,video/*" capture="environment" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
-          </label>
-          <label class="capture-btn" for="galleryInput">
-            <div class="capture-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="2" y="4" width="20" height="16" rx="2"/>
-                <circle cx="9" cy="11" r="3"/>
-                <path d="M21 15l-3.5-3.5a2 2 0 0 0-2.83 0L7 19"/>
-              </svg>
-            </div>
-            <div class="capture-title">Gallery</div>
-            <input id="galleryInput" type="file" accept="image/*,video/*" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
+            <div class="capture-title">Add Photos &amp; Videos</div>
+            <input id="fileInput" type="file" accept="image/*,video/*" multiple style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden;">
           </label>
         </div>
       </div>
@@ -477,8 +466,7 @@
   // ── Media capture ──────────────────────────────────────────────────────────
 
   const captureRow   = document.getElementById('captureRow');
-  const cameraInput  = document.getElementById('cameraInput');
-  const galleryInput = document.getElementById('galleryInput');
+  const fileInput    = document.getElementById('fileInput');
   const mediaGrid    = document.getElementById('mediaGrid');
 
   let selectedFiles = [];  // array of { file, objectUrl }
@@ -571,16 +559,10 @@
     renderGrid();
   }
 
-  cameraInput.addEventListener('change', () => {
-    const files = Array.from(cameraInput.files || []);
+  fileInput.addEventListener('change', () => {
+    const files = Array.from(fileInput.files || []);
     if (files.length) addFiles(files);
-    cameraInput.value = '';
-  });
-
-  galleryInput.addEventListener('change', () => {
-    const files = Array.from(galleryInput.files || []);
-    if (files.length) addFiles(files);
-    galleryInput.value = '';
+    fileInput.value = '';
   });
 
   // ── Voice transcription (shared template) ──────────────────────────────────
@@ -593,10 +575,7 @@
   });
 
   // Stop voice before file picker opens — iOS won't share the audio session
-  document.getElementById('cameraInput').addEventListener('click', () => {
-    if (voiceControl.isRecording()) voiceControl.stop();
-  });
-  document.getElementById('galleryInput').addEventListener('click', () => {
+  document.getElementById('fileInput').addEventListener('click', () => {
     if (voiceControl.isRecording()) voiceControl.stop();
   });
 
