@@ -10,7 +10,9 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import List, Optional
 
+import bleach
 import httpx
+import magic
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response as FastAPIResponse
 from pydantic import BaseModel
@@ -313,19 +315,31 @@ async def root():
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
+
+# Phase 5: explicit allowlist — only these two files are served from /shared/.
+# The parent-directory fallback is intentionally removed: in the Docker image
+# the shared/ directory is always at /app/shared/ (copied by the Dockerfile
+# `COPY . .` step). Local dev must mirror the same layout.
+SHARED_FILES = {
+    "voice-to-text.js": "application/javascript",
+    "croquet-dictionary.json": "application/json",
+}
+
+
 @app.get("/shared/{filename}")
 async def shared_file(filename: str):
     from fastapi.responses import Response
-    safe = Path(filename).name  # strip any path traversal
-    # Docker: shared/ is inside app dir; local dev: shared/ is sibling at apps/shared/
-    file_path = Path(__file__).parent / "shared" / safe
-    if not file_path.is_file():
-        file_path = Path(__file__).parent.parent / "shared" / safe
+    # Allowlist check first — anything not in the dict gets 404, no filesystem probe.
+    if filename not in SHARED_FILES:
+        raise HTTPException(status_code=404, detail="Not found")
+    content_type = SHARED_FILES[filename]
+    # Docker layout: shared/ lives inside the app directory at /app/shared/.
+    file_path = Path(__file__).parent / "shared" / filename
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     return Response(
         content=file_path.read_text(encoding="utf-8"),
-        media_type="application/javascript",
+        media_type=content_type,
     )
 
 
@@ -491,6 +505,12 @@ async def submit(
     name = name.strip()
     event = event.strip()
 
+    # Phase 5: sanitise caption on ingest — strip all HTML tags before storage.
+    # Defensive against XSS if a downstream renderer ever treats the body as HTML.
+    # bleach.clean with tags=[] strips everything; strip=True removes the tags
+    # rather than escaping them, so stored text is plain prose.
+    caption = bleach.clean(caption, tags=[], strip=True)
+
     if not name:
         raise HTTPException(status_code=422, detail="Name is required.")
 
@@ -570,11 +590,46 @@ async def submit(
             tmp = tempfile.SpooledTemporaryFile(max_size=SPOOL_MEM)
             tempfiles.append(tmp)
             chunk_size = 64 * 1024  # 64 KB
+            first_chunk = True
             while True:
                 chunk = await f.read(chunk_size)
                 if not chunk:
                     break
                 total_bytes += len(chunk)
+
+                # Phase 5: byte-level MIME sniffing on the leading bytes of the
+                # first chunk (~2 KB is enough for libmagic to identify the format).
+                # This is defence-in-depth: the client-declared MIME check above is
+                # the fast first gate; sniffing catches spoofed content_type headers.
+                if first_chunk:
+                    first_chunk = False
+                    sniffed_type = magic.from_buffer(chunk[:2048], mime=True)
+                    if not any(sniffed_type.startswith(p) for p in ALLOWED_MIME_PREFIXES):
+                        duration_ms = round((time.monotonic() - t_start) * 1000)
+                        logger.warning(
+                            "Submit rejected — byte-level MIME sniff mismatch",
+                            extra={
+                                "event": "mime_sniff_rejected",
+                                "claimed_type": f.content_type,
+                                "sniffed_type": sniffed_type,
+                                "upload_filename": f.filename,
+                                "client_ip": client_ip,
+                            },
+                        )
+                        logger.warning(
+                            "Submit failed — mime_sniff_rejected",
+                            extra={
+                                "event": "submit_failure",
+                                "duration_ms": duration_ms,
+                                "failure_reason": "mime_sniff_rejected",
+                                "submission_uuid": submission_uuid,
+                            },
+                        )
+                        raise HTTPException(
+                            status_code=415,
+                            detail="File content does not match declared type. Only images and videos are accepted.",
+                        )
+
                 # Phase 0: byte-count safety net for chunked transfers.
                 if total_bytes > MAX_SUBMIT_BYTES:
                     duration_ms = round((time.monotonic() - t_start) * 1000)

@@ -3,3 +3,5 @@ uvicorn
 httpx
 python-multipart
 slowapi
+python-magic
+bleach
