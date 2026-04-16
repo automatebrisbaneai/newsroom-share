@@ -3,13 +3,31 @@ import os
 import re
 import time
 import requests as http_requests
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from pathlib import Path
 from typing import List
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# ---------------------------------------------------------------------------
+# Rate limiter (Phase 0 — per-IP caps via slowapi)
+# /clean  : 10/minute + 100/day  — paid OpenRouter proxy, tightest cap
+# /submit : 30/hour              — genuine bursts from event day covered
+# ---------------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Phase 0: hard cap for /submit payload (bytes).  1 GB = 1 073 741 824 bytes.
+MAX_SUBMIT_BYTES = 1 * 1024 * 1024 * 1024
+
+# Phase 0: accepted MIME prefixes for uploaded files
+ALLOWED_MIME_PREFIXES = ("image/", "video/")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
@@ -109,48 +127,72 @@ async def shared_file(filename: str):
 
 
 @app.post("/clean")
-async def clean_transcript(req: TranscriptRequest):
-    res = http_requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": CLEAN_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": (
-                    _DICTIONARY_HINT
-                    + "Clean up this voice transcript into readable, properly punctuated text. "
-                    "The input has no punctuation — you must add it. "
-                    "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
-                    "Remove filler words (um, uh, like, you know, sort of). "
-                    "Fix run-on sentences by breaking them up. "
-                    "Fix speech recognition errors by reading the full sentence for context — "
-                    "use whole-sentence inference, not just adjacent words. "
-                    "Keep the meaning and tone exactly as intended. "
-                    "Return only the cleaned text, nothing else.\n\n"
-                    + req.text
-                ),
-            }],
-            "max_tokens": 4096,
-        },
-        timeout=30,
-    )
-    data = res.json()
-    if "choices" not in data:
-        raise HTTPException(status_code=502, detail=f"OpenRouter error: {data}")
-    return {"cleaned": data["choices"][0]["message"]["content"]}
+@limiter.limit("10/minute")
+@limiter.limit("100/day")
+async def clean_transcript(request: Request, req: TranscriptRequest):
+    try:
+        res = http_requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": CLEAN_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        _DICTIONARY_HINT
+                        + "Clean up this voice transcript into readable, properly punctuated text. "
+                        "The input has no punctuation — you must add it. "
+                        "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
+                        "Remove filler words (um, uh, like, you know, sort of). "
+                        "Fix run-on sentences by breaking them up. "
+                        "Fix speech recognition errors by reading the full sentence for context — "
+                        "use whole-sentence inference, not just adjacent words. "
+                        "Keep the meaning and tone exactly as intended. "
+                        "Return only the cleaned text, nothing else.\n\n"
+                        + req.text
+                    ),
+                }],
+                "max_tokens": 4096,
+            },
+            timeout=30,
+        )
+        data = res.json()
+        if "choices" not in data:
+            print(f"[clean] OpenRouter error response: {data}")
+            raise HTTPException(status_code=502, detail="Transcript cleaning failed, please try again.")
+        return {"cleaned": data["choices"][0]["message"]["content"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[clean] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Transcript cleaning failed, please try again.")
 
 
 @app.post("/submit")
+@limiter.limit("30/hour")
 async def submit(
+    request: Request,
     name: str = Form(...),
     event: str = Form(""),
     caption: str = Form(""),
     files: List[UploadFile] = File(default=[]),
 ):
+    # Phase 0: reject oversized payloads before reading file bytes into RAM.
+    # Check Content-Length header first (fast path — client must declare size).
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_SUBMIT_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Payload too large. Maximum total upload size is 1 GB.",
+                )
+        except ValueError:
+            pass  # malformed header — proceed and catch at read time
+
     name = name.strip()
     event = event.strip()
 
@@ -172,13 +214,35 @@ async def submit(
         "status": "submitted",
     }
 
-    # Read all files, assign first image as cover, rest go to media[]
+    # Read all files; enforce MIME whitelist and byte-count cap as we go.
     file_parts: list = []
     cover_set = False
+    total_bytes = 0
     for f in files:
         if not f.filename or not f.content_type:
             continue
+
+        # Phase 0: MIME whitelist — accept image/* and video/* only.
+        # Note: we trust the client-declared content_type for now.
+        # Byte-level sniffing (python-magic) is deferred to Phase 5 — it requires
+        # libmagic on the Docker image which adds build complexity.
+        if not any(f.content_type.startswith(p) for p in ALLOWED_MIME_PREFIXES):
+            raise HTTPException(
+                status_code=415,
+                detail=f"Unsupported file type '{f.content_type}'. Only images and videos are accepted.",
+            )
+
         content = await f.read()
+
+        # Phase 0: byte-count safety net — catch any payload that slipped past
+        # the Content-Length header check (e.g. chunked transfer).
+        total_bytes += len(content)
+        if total_bytes > MAX_SUBMIT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Payload too large. Maximum total upload size is 1 GB.",
+            )
+
         if not cover_set and f.content_type.startswith("image/"):
             file_parts.append(("cover_image", (f.filename, content, f.content_type)))
             cover_set = True
@@ -192,9 +256,11 @@ async def submit(
             token = refresh_token()
             r = _post_record(token, fields, file_parts)
         if not r.ok:
-            raise HTTPException(status_code=502, detail=f"PocketBase error: {r.text}")
+            print(f"[submit] PocketBase error {r.status_code}: {r.text}")
+            raise HTTPException(status_code=502, detail="Submission failed, please try again.")
         return {"ok": True, "id": r.json().get("id")}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[submit] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Submission failed, please try again.")
