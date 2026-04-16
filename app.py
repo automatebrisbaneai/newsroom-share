@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import uuid as uuid_lib
 from contextlib import asynccontextmanager
 
 import httpx
@@ -29,8 +30,11 @@ ALLOWED_MIME_PREFIXES = ("image/", "video/")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
-PB_NEWS_EMAIL = os.environ.get("PB_NEWS_ADMIN_EMAIL", os.environ.get("PB_ADMIN_EMAIL", ""))
-PB_NEWS_PASSWORD = os.environ.get("PB_NEWS_ADMIN_PASSWORD", os.environ.get("PB_ADMIN_PASSWORD", ""))
+# Phase 1B: scoped service account — writes to `submissions` only, never `news_articles`.
+# Uses the `users` auth collection, NOT `_superusers`.
+# The old PB_NEWS_ADMIN_* vars are kept in Coolify for the promote/reject scripts only.
+PB_NEWS_SUBMISSIONS_EMAIL = os.environ.get("PB_NEWS_SUBMISSIONS_EMAIL", "")
+PB_NEWS_SUBMISSIONS_PASSWORD = os.environ.get("PB_NEWS_SUBMISSIONS_PASSWORD", "")
 CLEAN_MODEL = "deepseek/deepseek-v3.2"
 
 # ---------------------------------------------------------------------------
@@ -86,9 +90,11 @@ _pb_token: str = ""
 
 
 async def _auth(client: httpx.AsyncClient) -> str:
+    """Authenticate as the scoped service account (users collection, not _superusers).
+    This account can only create records in the submissions collection."""
     r = await client.post(
-        f"{PB_NEWS_URL}/api/collections/_superusers/auth-with-password",
-        json={"identity": PB_NEWS_EMAIL, "password": PB_NEWS_PASSWORD},
+        f"{PB_NEWS_URL}/api/collections/users/auth-with-password",
+        json={"identity": PB_NEWS_SUBMISSIONS_EMAIL, "password": PB_NEWS_SUBMISSIONS_PASSWORD},
     )
     r.raise_for_status()
     return r.json()["token"]
@@ -108,8 +114,10 @@ async def refresh_token(client: httpx.AsyncClient) -> str:
 
 
 async def _post_record(client: httpx.AsyncClient, token: str, fields: dict, file_parts: list):
+    """Post to the submissions collection (not news_articles).
+    The scoped service account only has createRule on submissions."""
     headers = {"Authorization": f"Bearer {token}"}
-    url = f"{PB_NEWS_URL}/api/collections/news_articles/records"
+    url = f"{PB_NEWS_URL}/api/collections/submissions/records"
     if file_parts:
         # Multipart upload — use per-request extended read timeout for large files.
         files_payload = {}
@@ -237,13 +245,24 @@ async def submit(
     slug = re.sub(r'[\s_-]+', '-', slug).strip('-')[:60]
     slug = f"{slug}-{int(time.time())}"
 
+    # Phase 1B: generate server-side submission UUID for idempotency pre-wiring.
+    # Phase 2 will wire client-side UUIDs; for now this is server-generated.
+    submission_uuid = str(uuid_lib.uuid4())
+
+    # Capture client IP and user agent for abuse tracing.
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host
+    user_agent = request.headers.get("user-agent", "")[:500]
+
     fields = {
         "title": title,
         "slug": slug,
         "body": caption,
         "author_name": name,
         "category": "Events",
-        "status": "submitted",
+        "submission_uuid": submission_uuid,
+        "client_ip": client_ip,
+        "user_agent": user_agent,
+        "status": "pending",
     }
 
     # Read all files; enforce MIME whitelist and byte-count cap as we go.
