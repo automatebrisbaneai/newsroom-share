@@ -1,10 +1,13 @@
 import json
+import logging
 import os
 import re
+import sys
 import tempfile
 import time
 import uuid as uuid_lib
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import List, Optional
 
 import httpx
@@ -16,13 +19,60 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from logging_config import configure_logging, get_logger, REQUEST_ID
+# ---------------------------------------------------------------------------
+# Phase 4: Structured JSON logging
+#
+# Every log line is emitted as a single JSON object to stdout.
+# Coolify's log viewer handles line-based output, and JSON is grep/jq-able.
+#
+# REQUEST_ID ContextVar carries the per-request correlation ID.  Every log
+# call in the request handler picks it up automatically via the formatter.
+# ---------------------------------------------------------------------------
+REQUEST_ID: ContextVar[str] = ContextVar("request_id", default="")
 
-# ---------------------------------------------------------------------------
-# Logging — configure before first use so startup messages are structured too.
-# ---------------------------------------------------------------------------
-configure_logging()
-logger = get_logger(__name__)
+
+class _JsonFormatter(logging.Formatter):
+    """Serialise every log record as a single JSON line."""
+
+    _SKIP_KEYS = frozenset({
+        "name", "msg", "args", "levelname", "levelno", "pathname",
+        "filename", "module", "exc_info", "exc_text", "stack_info",
+        "lineno", "funcName", "created", "msecs", "relativeCreated",
+        "thread", "threadName", "processName", "process", "message",
+        "taskName",
+    })
+
+    def format(self, record: logging.LogRecord) -> str:
+        super().format(record)
+        out: dict = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": REQUEST_ID.get(""),
+        }
+        for key, value in record.__dict__.items():
+            if key not in self._SKIP_KEYS:
+                out[key] = value
+        if record.exc_text:
+            out["exc"] = record.exc_text
+        return json.dumps(out, default=str)
+
+
+def _configure_logging(level: int = logging.INFO) -> None:
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_JsonFormatter())
+    root.addHandler(handler)
+    root.setLevel(level)
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).propagate = False
+
+
+_configure_logging()
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Rate limiter (Phase 0 — per-IP caps via slowapi)
