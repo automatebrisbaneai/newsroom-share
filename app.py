@@ -2,7 +2,9 @@ import json
 import os
 import re
 import time
-import requests as http_requests
+from contextlib import asynccontextmanager
+
+import httpx
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -19,10 +21,6 @@ from slowapi.errors import RateLimitExceeded
 # ---------------------------------------------------------------------------
 limiter = Limiter(key_func=get_remote_address)
 
-app = FastAPI()
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
 # Phase 0: hard cap for /submit payload (bytes).  1 GB = 1 073 741 824 bytes.
 MAX_SUBMIT_BYTES = 1 * 1024 * 1024 * 1024
 
@@ -34,6 +32,33 @@ PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
 PB_NEWS_EMAIL = os.environ.get("PB_NEWS_ADMIN_EMAIL", os.environ.get("PB_ADMIN_EMAIL", ""))
 PB_NEWS_PASSWORD = os.environ.get("PB_NEWS_ADMIN_PASSWORD", os.environ.get("PB_ADMIN_PASSWORD", ""))
 CLEAN_MODEL = "deepseek/deepseek-v3.2"
+
+# ---------------------------------------------------------------------------
+# Default timeouts (Phase 2a — httpx per-phase timeouts)
+# connect=5s  : TCP handshake must complete quickly
+# read=30s    : normal API responses (OpenRouter + PB JSON endpoints)
+# write=30s   : request body upload
+# pool=5s     : waiting for a free connection from the pool
+# For _post_record with file uploads, read timeout is extended to 120s inline.
+# ---------------------------------------------------------------------------
+DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
+FILE_UPLOAD_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """Create a shared httpx.AsyncClient for the app lifetime."""
+    client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    application.state.http = client
+    try:
+        yield
+    finally:
+        await client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 def _load_croquet_dictionary() -> dict:
@@ -60,43 +85,50 @@ _DICTIONARY_HINT = (
 _pb_token: str = ""
 
 
-def _auth() -> str:
-    r = http_requests.post(
+async def _auth(client: httpx.AsyncClient) -> str:
+    r = await client.post(
         f"{PB_NEWS_URL}/api/collections/_superusers/auth-with-password",
         json={"identity": PB_NEWS_EMAIL, "password": PB_NEWS_PASSWORD},
-        timeout=10,
     )
     r.raise_for_status()
     return r.json()["token"]
 
 
-def get_token() -> str:
+async def get_token(client: httpx.AsyncClient) -> str:
     global _pb_token
     if not _pb_token:
-        _pb_token = _auth()
+        _pb_token = await _auth(client)
     return _pb_token
 
 
-def refresh_token() -> str:
+async def refresh_token(client: httpx.AsyncClient) -> str:
     global _pb_token
-    _pb_token = _auth()
+    _pb_token = await _auth(client)
     return _pb_token
 
 
-def _post_record(token: str, fields: dict, file_parts: list):
+async def _post_record(client: httpx.AsyncClient, token: str, fields: dict, file_parts: list):
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{PB_NEWS_URL}/api/collections/news_articles/records"
     if file_parts:
-        return http_requests.post(
-            f"{PB_NEWS_URL}/api/collections/news_articles/records",
-            headers={"Authorization": f"Bearer {token}"},
-            data=fields,
-            files=file_parts,
-            timeout=120,
+        # Multipart upload — use per-request extended read timeout for large files.
+        files_payload = {}
+        data_payload = fields
+        # httpx multipart: files dict maps field name → (filename, content, mime)
+        for idx, (field_name, (filename, content, mime)) in enumerate(file_parts):
+            key = f"{field_name}_{idx}" if idx > 0 else field_name
+            files_payload[key] = (filename, content, mime)
+        return await client.post(
+            url,
+            headers=headers,
+            data=data_payload,
+            files=files_payload,
+            timeout=FILE_UPLOAD_TIMEOUT,
         )
-    return http_requests.post(
-        f"{PB_NEWS_URL}/api/collections/news_articles/records",
-        headers={"Authorization": f"Bearer {token}"},
+    return await client.post(
+        url,
+        headers=headers,
         json=fields,
-        timeout=30,
     )
 
 
@@ -130,8 +162,9 @@ async def shared_file(filename: str):
 @limiter.limit("10/minute")
 @limiter.limit("100/day")
 async def clean_transcript(request: Request, req: TranscriptRequest):
+    client: httpx.AsyncClient = request.app.state.http
     try:
-        res = http_requests.post(
+        res = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -157,7 +190,6 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                 }],
                 "max_tokens": 4096,
             },
-            timeout=30,
         )
         data = res.json()
         if "choices" not in data:
@@ -249,13 +281,14 @@ async def submit(
         else:
             file_parts.append(("media", (f.filename, content, f.content_type)))
 
+    client: httpx.AsyncClient = request.app.state.http
     try:
-        token = get_token()
-        r = _post_record(token, fields, file_parts)
+        token = await get_token(client)
+        r = await _post_record(client, token, fields, file_parts)
         if r.status_code in (401, 403):
-            token = refresh_token()
-            r = _post_record(token, fields, file_parts)
-        if not r.ok:
+            token = await refresh_token(client)
+            r = await _post_record(client, token, fields, file_parts)
+        if not r.is_success:
             print(f"[submit] PocketBase error {r.status_code}: {r.text}")
             raise HTTPException(status_code=502, detail="Submission failed, please try again.")
         return {"ok": True, "id": r.json().get("id")}

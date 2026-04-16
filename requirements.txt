@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-requests
+httpx
 python-multipart
 slowapi
