@@ -112,9 +112,35 @@ FILE_UPLOAD_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """Create a shared httpx.AsyncClient for the app lifetime."""
+    """Create a shared httpx.AsyncClient for the app lifetime.
+
+    Also performs a fail-fast PB auth check on startup: if the scoped service
+    account credentials are missing or wrong, the process exits 1 immediately so
+    Coolify shows the container as unhealthy rather than silently degrading.
+    """
     client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
     application.state.http = client
+
+    # ── Fail-fast auth verification ─────────────────────────────────
+    try:
+        token = await _auth(client)
+        # Cache it so the first real request doesn't need a second round-trip.
+        global _pb_token
+        _pb_token = token
+        logger.info(
+            "PB auth OK as %s",
+            PB_NEWS_SUBMISSIONS_EMAIL,
+            extra={"event": "pb_auth_startup", "status": "ok"},
+        )
+    except Exception as exc:
+        logger.critical(
+            "FATAL: PB auth failed — check PB_NEWS_SUBMISSIONS_EMAIL / PB_NEWS_SUBMISSIONS_PASSWORD. Error: %s",
+            exc,
+            extra={"event": "pb_auth_startup", "status": "fatal"},
+        )
+        await client.aclose()
+        sys.exit(1)
+
     logger.info("Application startup", extra={"event": "app_startup"})
     try:
         yield
@@ -307,6 +333,25 @@ async def _post_record(client: httpx.AsyncClient, token: str, fields: dict, file
 
 class TranscriptRequest(BaseModel):
     text: str
+
+
+@app.get("/healthz")
+async def healthz(request: Request):
+    """Health check: forces a fresh PB auth round-trip.
+
+    Returns 200 with pb_auth:ok on success, 503 with pb_auth:failed on error.
+    Used by Docker HEALTHCHECK and Coolify monitoring.
+    """
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        await _auth(client)
+        return {"status": "ok", "pb_auth": "ok", "pb_url": PB_NEWS_URL}
+    except Exception as exc:
+        from fastapi.responses import JSONResponse as _JSONResponse
+        return _JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "pb_auth": "failed", "error": str(exc)},
+        )
 
 
 @app.get("/")
