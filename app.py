@@ -90,8 +90,9 @@ MAX_SUBMIT_BYTES = 1 * 1024 * 1024 * 1024
 ALLOWED_MIME_PREFIXES = ("image/", "video/")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-NEWSROOM_API_URL = os.environ.get("NEWSROOM_API_URL", "https://my.croquetwade.com")
-NEWSROOM_API_TOKEN = os.environ.get("NEWSROOM_API_TOKEN", "")
+PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
+PB_NEWS_SUBMISSIONS_EMAIL = os.environ.get("PB_NEWS_SUBMISSIONS_EMAIL", "")
+PB_NEWS_SUBMISSIONS_PASSWORD = os.environ.get("PB_NEWS_SUBMISSIONS_PASSWORD", "")
 CLEAN_MODEL = "deepseek/deepseek-v3.2"
 
 MIN_WORD_CHARS = 3
@@ -140,42 +141,57 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
 FILE_UPLOAD_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
 
 
+_pb_token: str = ""
+
+
+async def _auth(client: httpx.AsyncClient) -> str:
+    """Authenticate as the scoped service account against pb-news."""
+    r = await client.post(
+        f"{PB_NEWS_URL}/api/collections/users/auth-with-password",
+        json={"identity": PB_NEWS_SUBMISSIONS_EMAIL, "password": PB_NEWS_SUBMISSIONS_PASSWORD},
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+async def get_token(client: httpx.AsyncClient) -> str:
+    global _pb_token
+    if not _pb_token:
+        _pb_token = await _auth(client)
+    return _pb_token
+
+
+async def refresh_token(client: httpx.AsyncClient) -> str:
+    global _pb_token
+    logger.info("PocketBase auth — refreshing token", extra={"event": "pb_auth_refresh"})
+    _pb_token = await _auth(client)
+    return _pb_token
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Create a shared httpx.AsyncClient for the app lifetime.
 
-    Also performs a fail-fast PB auth check on startup: if the scoped service
-    account credentials are missing or wrong, the process exits 1 immediately so
-    Coolify shows the container as unhealthy rather than silently degrading.
+    Performs a fail-fast PB auth check on startup so Coolify shows the
+    container as unhealthy rather than silently degrading.
     """
     client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
     application.state.http = client
 
-    # ── Fail-fast API token verification ─────────────────────────────
-    if not NEWSROOM_API_TOKEN:
-        logger.critical(
-            "FATAL: NEWSROOM_API_TOKEN is not set.",
-            extra={"event": "api_auth_startup", "status": "fatal"},
-        )
-        await client.aclose()
-        sys.exit(1)
     try:
-        r = await client.get(
-            f"{NEWSROOM_API_URL}/api/newsroom",
-            headers={"Authorization": f"Bearer {NEWSROOM_API_TOKEN}"},
-            params={"type": "article", "scope": "all", "perPage": 1},
-        )
-        r.raise_for_status()
+        token = await _auth(client)
+        global _pb_token
+        _pb_token = token
         logger.info(
-            "MyCroquet API ping OK at %s",
-            NEWSROOM_API_URL,
-            extra={"event": "api_auth_startup", "status": "ok"},
+            "PB auth OK as %s",
+            PB_NEWS_SUBMISSIONS_EMAIL,
+            extra={"event": "pb_auth_startup", "status": "ok"},
         )
     except Exception as exc:
         logger.critical(
-            "FATAL: MyCroquet API ping failed — check NEWSROOM_API_URL / NEWSROOM_API_TOKEN. Error: %s",
+            "FATAL: PB auth failed — check PB_NEWS_SUBMISSIONS_EMAIL / PB_NEWS_SUBMISSIONS_PASSWORD. Error: %s",
             exc,
-            extra={"event": "api_auth_startup", "status": "fatal"},
+            extra={"event": "pb_auth_startup", "status": "fatal"},
         )
         await client.aclose()
         sys.exit(1)
@@ -318,64 +334,103 @@ _CLEAN_SYSTEM_PROMPT = (
     + _DICTIONARY_HINT
 )
 
-def _mc_headers() -> dict:
-    return {"Authorization": f"Bearer {NEWSROOM_API_TOKEN}"}
+def _slugify(text: str) -> str:
+    """Convert title to a URL-safe slug."""
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "-", text)
+    return text[:80].strip("-")
 
 
-async def _post_to_mycroquet(
+async def _post_to_pocketbase(
     client: httpx.AsyncClient,
     fields: dict,
     cover: tuple | None,
     media_parts: list,
 ) -> str:
-    """Create a content_item via MyCroquet API and submit it for review.
+    """Write a submitted content_item directly to pb-news, then attach media and author.
 
     cover is (filename, file_handle, mime) or None.
     media_parts is a list of (filename, file_handle, mime) for additional files.
-    Returns the new item's id.
+    Returns the new content_item id.
     """
-    data: dict = {
+    token = await get_token(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"{PB_NEWS_URL}/api/collections/content_items/records"
+
+    # Idempotency: return existing record if same submission_uuid already exists.
+    submission_uuid = fields.get("type_data", {}).get("submission_uuid", "")
+    if submission_uuid:
+        try:
+            check = await client.get(
+                url,
+                headers=headers,
+                params={"filter": f'type_data.submission_uuid = "{submission_uuid}"', "perPage": 1},
+            )
+            if check.is_success:
+                items = check.json().get("items", [])
+                if items:
+                    logger.info("Duplicate submission_uuid — returning existing id", extra={"event": "pb_submit_idempotent", "id": items[0]["id"]})
+                    return items[0]["id"]
+        except Exception:
+            pass  # idempotency check failed — proceed with new create
+
+    slug = _slugify(fields["title"]) + "-" + uuid_lib.uuid4().hex[:8]
+    data = {
         "type": "article",
+        "status": "submitted",
+        "visibility": "public",
+        "slug": slug,
         "title": fields["title"],
         "body": fields["body"],
-        "visibility": "public",
+        "aims": "[]",
+        "type_data": json.dumps(fields.get("type_data", {})),
     }
-    files = {}
+
+    files_payload: dict = {}
     if cover:
         filename, fh, mime = cover
-        files["cover_image"] = (filename, fh, mime)
+        files_payload["cover_image"] = (filename, fh, mime)
 
-    r = await client.post(
-        f"{NEWSROOM_API_URL}/api/newsroom",
-        headers=_mc_headers(),
-        data=data,
-        files=files if files else None,
-        timeout=FILE_UPLOAD_TIMEOUT,
-    )
+    for attempt in range(2):
+        if files_payload:
+            r = await client.post(url, headers=headers, data=data, files=files_payload, timeout=FILE_UPLOAD_TIMEOUT)
+        else:
+            r = await client.post(url, headers=headers, json=data, timeout=FILE_UPLOAD_TIMEOUT)
+
+        if r.status_code in (401, 403) and attempt == 0:
+            token = await refresh_token(client)
+            headers = {"Authorization": f"Bearer {token}"}
+            continue
+        break
+
     if not r.is_success:
-        raise HTTPException(status_code=502, detail=f"Newsroom API error: {r.text}")
+        raise HTTPException(status_code=502, detail=f"PB write error: {r.text}")
+
     record_id: str = r.json()["id"]
 
-    # Move to submitted so it appears in the editorial review queue.
-    patch = await client.patch(
-        f"{NEWSROOM_API_URL}/api/newsroom/{record_id}",
-        headers={**_mc_headers(), "Content-Type": "application/json"},
-        json={"status": "submitted"},
-    )
-    if not patch.is_success:
-        logger.warning("Status patch failed (non-fatal)", extra={"event": "submit_patch_fail", "id": record_id, "status": patch.status_code})
-
-    # Attach additional media files.
+    # Attach extra media files to content_media.
     for filename, fh, mime in media_parts:
         med = await client.post(
-            f"{NEWSROOM_API_URL}/api/newsroom/{record_id}/media",
-            headers=_mc_headers(),
-            data={"kind": "gallery"},
+            f"{PB_NEWS_URL}/api/collections/content_media/records",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"content_id": record_id, "kind": "gallery", "order": 0},
             files={"file": (filename, fh, mime)},
             timeout=FILE_UPLOAD_TIMEOUT,
         )
         if not med.is_success:
-            logger.warning("Media attach failed (non-fatal)", extra={"event": "media_attach_fail", "id": record_id, "status": med.status_code})
+            logger.warning("content_media attach failed (non-fatal)", extra={"event": "pb_media_fail", "id": record_id, "status": med.status_code})
+
+    # Write content_authors row so the submitter's name is linked.
+    submitter_name = fields.get("type_data", {}).get("submitter_name", "")
+    if submitter_name:
+        auth_r = await client.post(
+            f"{PB_NEWS_URL}/api/collections/content_authors/records",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"content_id": record_id, "member_id": "share", "external_name": submitter_name, "role": "primary", "order": 0, "visible": True},
+        )
+        if not auth_r.is_success:
+            logger.warning("content_authors attach failed (non-fatal)", extra={"event": "pb_author_fail", "id": record_id, "status": auth_r.status_code})
 
     return record_id
 
@@ -386,25 +441,20 @@ class TranscriptRequest(BaseModel):
 
 @app.get("/healthz")
 async def healthz(request: Request):
-    """Health check: pings MyCroquet API.
+    """Health check: forces a fresh PB auth round-trip.
 
-    Returns 200 with api:ok on success, 503 on error.
+    Returns 200 with pb_auth:ok on success, 503 on error.
     Used by Docker HEALTHCHECK and Coolify monitoring.
     """
     client: httpx.AsyncClient = request.app.state.http
     try:
-        r = await client.get(
-            f"{NEWSROOM_API_URL}/api/newsroom",
-            headers=_mc_headers(),
-            params={"type": "article", "scope": "all", "perPage": 1},
-        )
-        r.raise_for_status()
-        return {"status": "ok", "api": "ok", "api_url": NEWSROOM_API_URL}
+        await _auth(client)
+        return {"status": "ok", "pb_auth": "ok", "pb_url": PB_NEWS_URL}
     except Exception as exc:
         from fastapi.responses import JSONResponse as _JSONResponse
         return _JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "api": "failed", "error": str(exc)},
+            content={"status": "unhealthy", "pb_auth": "failed", "error": str(exc)},
         )
 
 
@@ -642,6 +692,11 @@ async def submit(
     fields = {
         "title": title,
         "body": caption,
+        "type_data": {
+            "submission_uuid": submission_uuid,
+            "submitter_name": name,
+            "event": event,
+        },
     }
 
     # Phase 2: stream uploads via SpooledTemporaryFile.
@@ -774,12 +829,12 @@ async def submit(
 
         try:
             t_api_start = time.monotonic()
-            record_id = await _post_to_mycroquet(http_client, fields, cover_part, media_parts_list)
+            record_id = await _post_to_pocketbase(http_client, fields, cover_part, media_parts_list)
             api_duration_ms = round((time.monotonic() - t_api_start) * 1000)
             logger.info(
-                "MyCroquet submit succeeded",
+                "PB submit succeeded",
                 extra={
-                    "event": "api_submit",
+                    "event": "pb_submit",
                     "record_id": record_id,
                     "submission_uuid": submission_uuid,
                     "duration_ms": api_duration_ms,
