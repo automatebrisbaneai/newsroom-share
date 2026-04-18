@@ -98,6 +98,40 @@ PB_NEWS_SUBMISSIONS_EMAIL = os.environ.get("PB_NEWS_SUBMISSIONS_EMAIL", "")
 PB_NEWS_SUBMISSIONS_PASSWORD = os.environ.get("PB_NEWS_SUBMISSIONS_PASSWORD", "")
 CLEAN_MODEL = "deepseek/deepseek-v3.2"
 
+MIN_WORD_CHARS = 3
+
+_SUSPICIOUS_STARTS = (
+    "i ", "i'", "i\u2019", "sure", "certainly", "okay", "of course",
+    "please", "here is", "here's", "understood",
+)
+_SUSPICIOUS_SUBSTRINGS = (
+    "provide the transcript", "provide the text", "provide the voice",
+    "i will process", "i understand", "i'll clean", "i will clean",
+    "as an ai", "happy to help",
+)
+
+
+def _looks_like_meta_response(raw_input: str, model_output: str) -> bool:
+    if not model_output:
+        return False
+    stripped = model_output.strip().lower()
+    if not stripped:
+        return False
+    if stripped.startswith(_SUSPICIOUS_STARTS):
+        return True
+    if any(s in stripped for s in _SUSPICIOUS_SUBSTRINGS):
+        return True
+    in_words = {w for w in re.findall(r"[a-z]+", raw_input.lower()) if len(w) > 2}
+    out_words = re.findall(r"[a-z]+", stripped)
+    if in_words and len(out_words) > len(in_words) * 3:
+        overlap = sum(1 for w in out_words if w in in_words)
+        if overlap < max(2, len(in_words) // 3):
+            return True
+    return False
+
+
+_CLEAN_SYSTEM_PROMPT = None  # populated after _DICTIONARY_HINT is built (lower in file)
+
 # ---------------------------------------------------------------------------
 # Default timeouts (Phase 2a — httpx per-phase timeouts)
 # connect=5s  : TCP handshake must complete quickly
@@ -263,6 +297,22 @@ _DICTIONARY_HINT = (
     + ". "
 ) if (_DICTIONARY.get("terms") or _DICTIONARY.get("players")) else ""
 
+_CLEAN_SYSTEM_PROMPT = (
+    "You are a transcript cleaner. You receive raw voice-recognition text "
+    "and return ONLY the cleaned text. Rules:\n"
+    "- Add punctuation (commas, full stops, question marks).\n"
+    "- Capitalise the start of sentences.\n"
+    "- Remove filler words (um, uh, like, you know, sort of).\n"
+    "- Fix run-on sentences by breaking them up.\n"
+    "- Fix speech-recognition errors using whole-sentence context.\n"
+    "- Keep meaning and tone exactly as intended.\n"
+    "You NEVER respond conversationally. You NEVER ask for input. "
+    "You NEVER explain what you are doing. If the input is empty, whitespace, "
+    "a single word, or otherwise not a usable transcript, return it verbatim. "
+    "Output is the cleaned transcript text and nothing else.\n"
+    + _DICTIONARY_HINT
+)
+
 _pb_token: str = ""
 
 
@@ -398,7 +448,22 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
         or (request.client.host if request.client else "unknown")
     )
     t_start = time.monotonic()
-    input_chars = len(req.text)
+    raw = req.text or ""
+    input_chars = len(raw)
+
+    # Input guard — too few word chars means there's nothing to clean.
+    # Short-circuit without touching OpenRouter: no prompt, no meta-chatter risk.
+    word_char_count = sum(1 for c in raw if c.isalpha())
+    if word_char_count < MIN_WORD_CHARS:
+        logger.info(
+            "Clean short-circuit — input below MIN_WORD_CHARS",
+            extra={
+                "event": "clean_short_circuit",
+                "input_chars": input_chars,
+                "word_chars": word_char_count,
+            },
+        )
+        return {"cleaned": raw}
 
     try:
         t_or_start = time.monotonic()
@@ -410,22 +475,10 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
             },
             json={
                 "model": CLEAN_MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": (
-                        _DICTIONARY_HINT
-                        + "Clean up this voice transcript into readable, properly punctuated text. "
-                        "The input has no punctuation — you must add it. "
-                        "Capitalise the start of sentences. Add commas, full stops, and question marks where needed. "
-                        "Remove filler words (um, uh, like, you know, sort of). "
-                        "Fix run-on sentences by breaking them up. "
-                        "Fix speech recognition errors by reading the full sentence for context — "
-                        "use whole-sentence inference, not just adjacent words. "
-                        "Keep the meaning and tone exactly as intended. "
-                        "Return only the cleaned text, nothing else.\n\n"
-                        + req.text
-                    ),
-                }],
+                "messages": [
+                    {"role": "system", "content": _CLEAN_SYSTEM_PROMPT},
+                    {"role": "user", "content": raw},
+                ],
                 "max_tokens": 4096,
             },
         )
@@ -470,6 +523,21 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                 "output_chars": output_chars,
             },
         )
+
+        if _looks_like_meta_response(raw, cleaned):
+            logger.warning(
+                "Suspicious model output — falling back to raw input",
+                extra={
+                    "event": "clean_suspicious_output",
+                    "input_chars": input_chars,
+                    "output_chars": output_chars,
+                    "input_preview": raw[:120],
+                    "output_preview": cleaned[:240],
+                },
+            )
+            cleaned = raw
+            output_chars = len(cleaned)
+
         duration_ms = round((time.monotonic() - t_start) * 1000)
         logger.info(
             "Clean succeeded",

@@ -53,6 +53,10 @@
         filter: none;
         opacity: 1;
       }
+      .vtt-interim .vtt-cleaned {
+        color: #0f172a;
+        font-weight: 500;
+      }
       .vtt-btn {
         width: 36px;
         height: 36px;
@@ -123,6 +127,44 @@
   const MIC_SVG  = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>';
   const STOP_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
 
+  // ── Chunk timing ────────────────────────────────────────────────────────
+  // Ship a progressive chunk to /clean when the speaker pauses for PAUSE_MS.
+  // MAX_CHUNK_MS is a safety fallback so continuous talkers still see output.
+  const PAUSE_MS       = 2500;
+  const MAX_CHUNK_MS   = 120000;
+  const TICK_MS        = 500;
+  // Minimum finalised-text length before a pause will flush a chunk.
+  // A thinking "um" with an accidental final-result flush is noise the
+  // LLM mishandles — skip it until either the speaker keeps talking (so
+  // the chunk grows) or MAX_CHUNK_MS fires (safety fallback).
+  const MIN_CHUNK_CHARS = 40;
+
+  // ── Meta-response detector ──────────────────────────────────────────────
+  // Matches the same patterns the backend fallbacks catch — this is
+  // defence-in-depth for when an old container is still running the
+  // prior prompt and the server-side guard isn't live yet.
+  const META_START = /^\s*(i['\u2019]?|sure|certainly|okay|of course|please|here is|here's|understood)\b/i;
+  const META_PHRASES = [
+    'provide the transcript',
+    'provide the text',
+    'provide the voice',
+    'i will process',
+    'i understand',
+    "i'll clean",
+    'i will clean',
+    'as an ai',
+    'happy to help',
+  ];
+  function looksLikeMetaResponse(raw, out) {
+    if (!out) return false;
+    const s = out.toLowerCase();
+    if (META_START.test(out)) return true;
+    for (let i = 0; i < META_PHRASES.length; i++) {
+      if (s.indexOf(META_PHRASES[i]) !== -1) return true;
+    }
+    return false;
+  }
+
   // ── Blur levels ──────────────────────────────────────────────────────────
   const FADE_WORDS = 6;
   const LEVELS = [
@@ -136,26 +178,37 @@
 
   const DOT = '<span class="vtt-dot"></span>';
 
-  function setInterimText(el, text, showDot) {
-    const words = text.trim().split(/\s+/).filter(Boolean);
-    if (!words.length) { el.innerHTML = ''; return; }
+  function buildLiveHtml(text, showDot) {
     const dot = showDot !== false ? DOT : '';
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return dot;
 
     if (words.length <= FADE_WORDS) {
-      el.innerHTML = words.map((w, i) => {
+      return words.map((w, i) => {
         const pos = words.length - 1 - i;
         const lvl = LEVELS[Math.min(pos, LEVELS.length - 1)];
         return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${esc(w)}</span>`;
       }).join(' ') + dot;
-    } else {
-      const blurred = words.slice(0, -FADE_WORDS).map(esc).join(' ');
-      const fading = words.slice(-FADE_WORDS).map((w, i) => {
-        const pos = FADE_WORDS - 1 - i;
-        const lvl = LEVELS[Math.min(pos, LEVELS.length - 1)];
-        return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${esc(w)}</span>`;
-      }).join(' ');
-      el.innerHTML = `<span class="vtt-blurred">${blurred}</span> ${fading}${dot}`;
     }
+    const blurred = words.slice(0, -FADE_WORDS).map(esc).join(' ');
+    const fading = words.slice(-FADE_WORDS).map((w, i) => {
+      const pos = FADE_WORDS - 1 - i;
+      const lvl = LEVELS[Math.min(pos, LEVELS.length - 1)];
+      return `<span style="filter:blur(${lvl.blur}px);opacity:${lvl.opacity}">${esc(w)}</span>`;
+    }).join(' ');
+    return `<span class="vtt-blurred">${blurred}</span> ${fading}${dot}`;
+  }
+
+  // Render combined cleaned (unblurred, slightly bolder) + live (blur fade + dot)
+  // inside the interim div, so the user sees one flowing transcript where the
+  // cleaned prefix grows in place as chunks come back from /clean.
+  function renderInterim(el, cleanedText, liveText, showDot) {
+    const cleanedPart = cleanedText && cleanedText.trim()
+      ? `<span class="vtt-cleaned">${esc(cleanedText.trim())}</span>`
+      : '';
+    const liveHtml = buildLiveHtml(liveText || '', showDot);
+    const joiner   = cleanedPart && liveHtml ? ' ' : '';
+    el.innerHTML   = cleanedPart + joiner + liveHtml;
   }
 
   function esc(s) {
@@ -205,29 +258,55 @@
     targetEl.parentNode.insertBefore(hintEl, targetEl.nextSibling);
 
     // ── State ────────────────────────────────────────────────────────────
-    let recognition  = null;
-    let isRecording  = false;
-    let accumulated  = '';
-    let sessionFinal = '';
-    let cleanedSoFar = '';
-    let preVoice     = '';
-    let wakeLock     = null;
-    let chunkTimer   = null;
-
-    function startChunkTimer() {
-      chunkTimer = setInterval(() => {
-        if (!isRecording) return;
-        const text = (accumulated + sessionFinal).trim();
-        if (text) {
-          accumulated  = '';
-          sessionFinal = '';
-          cleanChunkInBackground(text);
-        }
-      }, 10000);
+    let recognition        = null;
+    let isRecording        = false;
+    let shippedResultCount = 0;    // how many event.results have been sent to /clean
+    let pendingFinal       = '';   // finalised speech since the last ship, waiting to go
+    let pendingFinalCount  = 0;    // how many event.results contribute to pendingFinal
+    let cleanedSoFar       = '';
+    let preVoice           = '';
+    let wakeLock           = null;
+    let tickTimer          = null;
+    let lastSpeechAt       = 0;    // ms timestamp of last onresult (any result)
+    let lastShipAt         = 0;    // ms timestamp of last shipped chunk
+    let latestInterim      = '';   // current in-progress interim speech, for async re-renders
+    // Every chunk shipped to /clean is appended here; the cleaned response
+    // removes its own entry. Tracked as a list (not a single string) so two
+    // overlapping round-trips can never produce a visual gap.
+    let inFlightChunks     = [];   // array of { id, text }
+    let inFlightSeq        = 0;    // monotonic id
+    function inFlightJoined() {
+      return inFlightChunks.map(c => c.text).join(' ');
     }
 
-    function stopChunkTimer() {
-      if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
+    function startTickTimer() {
+      lastShipAt = Date.now();
+      tickTimer = setInterval(() => {
+        if (!isRecording) return;
+        const text = pendingFinal.trim();
+        if (!text) return;
+        const now = Date.now();
+        const paused = (now - lastSpeechAt) >= PAUSE_MS;
+        const maxed  = (now - lastShipAt)   >= MAX_CHUNK_MS;
+        // Paused with a substantial chunk → ship.
+        // Paused but chunk still tiny → wait (don't send "um" alone).
+        // Maxed → ship regardless (safety fallback for continuous talkers).
+        if (maxed || (paused && text.length >= MIN_CHUNK_CHARS)) shipChunk();
+      }, TICK_MS);
+    }
+
+    function stopTickTimer() {
+      if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+    }
+
+    function shipChunk() {
+      const text = pendingFinal.trim();
+      if (!text) return;
+      shippedResultCount += pendingFinalCount;
+      pendingFinal       = '';
+      pendingFinalCount  = 0;
+      lastShipAt         = Date.now();
+      cleanChunkInBackground(text);
     }
 
     function setCaption(voiceText) {
@@ -263,15 +342,34 @@
       recognition.lang           = lang;
 
       recognition.onresult = (event) => {
-        sessionFinal = '';
-        let interim  = '';
-        for (let i = 0; i < event.results.length; i++) {
-          if (event.results[i].isFinal) sessionFinal += event.results[i][0].transcript + ' ';
-          else interim += event.results[i][0].transcript;
+        lastSpeechAt      = Date.now();
+        pendingFinal      = '';
+        pendingFinalCount = 0;
+        let interim       = '';
+        // Only iterate results that haven't been shipped to /clean yet.
+        // event.results is cumulative across the life of this recognition
+        // object — starting at shippedResultCount gives us the true delta.
+        for (let i = shippedResultCount; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            pendingFinal     += event.results[i][0].transcript + ' ';
+            pendingFinalCount = i - shippedResultCount + 1;
+          } else {
+            interim += event.results[i][0].transcript;
+          }
         }
-        // Interim div shows only current in-progress speech
-        const currentSpeech = sessionFinal + interim;
-        setInterimText(interimEl, currentSpeech);
+        latestInterim = interim;
+        // Combined display: cleaned prefix (unblurred) + live blur tail.
+        // preVoice is whatever the textarea held before recording started —
+        // it's already "clean" so it sits in the cleaned prefix too.
+        // inFlightChunks are chunks shipped to /clean but not yet returned —
+        // keep them visible (blurred) so the user never sees words vanish
+        // during a round-trip. Two overlapping round-trips are safe because
+        // each chunk has its own entry; only its own response removes it.
+        const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()]
+          .filter(Boolean).join(' ');
+        const liveText = [inFlightJoined(), pendingFinal + interim]
+          .filter(s => s && s.trim()).join(' ');
+        renderInterim(interimEl, cleanedPrefix, liveText);
       };
 
       recognition.onerror = (e) => {
@@ -285,10 +383,15 @@
 
       recognition.onend = () => {
         if (isRecording) {
-          // Grab buffered text from this recognition cycle
-          const chunkText = (accumulated + sessionFinal).trim();
-          accumulated  = '';
-          sessionFinal = '';
+          // Ship any un-shipped finalised speech before we tear down this
+          // recognition object — initRecognition() resets event.results to
+          // empty, so we'd lose the context otherwise.
+          const chunkText = pendingFinal.trim();
+          pendingFinal      = '';
+          pendingFinalCount = 0;
+          // Fresh recognition object's event.results starts at 0, so our
+          // cursor must too.
+          shippedResultCount = 0;
           // Create a fresh recognition object before restarting — calling
           // recognition.start() on the same object that just fired onend
           // throws InvalidStateError on Chrome/Android, which the catch
@@ -304,6 +407,7 @@
             return;
           }
           if (chunkText) {
+            lastShipAt = Date.now();
             cleanChunkInBackground(chunkText);
           }
         }
@@ -314,17 +418,33 @@
     function appendCleanedChunk(text) {
       cleanedSoFar = cleanedSoFar ? cleanedSoFar.trimEnd() + '\n\n' + text : text;
       setCaption(cleanedSoFar);
-      // Make textarea visible now that there's clean content
-      targetEl.style.display = '';
-      // Animate the textarea to signal new text landed
-      targetEl.classList.remove('vtt-chunk-new');
-      // Force reflow so removing+re-adding the class triggers the animation
-      void targetEl.offsetWidth;
-      targetEl.classList.add('vtt-chunk-new');
-      setTimeout(() => targetEl.classList.remove('vtt-chunk-new'), 450);
+      if (isRecording) {
+        // While recording the textarea stays hidden — the interim div is
+        // the single display. Re-render so the just-cleaned chunk appears
+        // as unblurred prefix in place of the blurred pending speech.
+        const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()]
+          .filter(Boolean).join(' ');
+        renderInterim(interimEl, cleanedPrefix, pendingFinal + latestInterim, true);
+      } else {
+        // Post-stop finalisation — textarea is the edit surface now.
+        targetEl.style.display = '';
+        targetEl.classList.remove('vtt-chunk-new');
+        void targetEl.offsetWidth;
+        targetEl.classList.add('vtt-chunk-new');
+        setTimeout(() => targetEl.classList.remove('vtt-chunk-new'), 450);
+      }
     }
 
     function cleanChunkInBackground(text) {
+      // Noise guard — skip chunks that have no transcribable content.
+      // Prevents the LLM from seeing a near-empty prompt and responding
+      // with meta-chatter like "please provide the transcript".
+      if (!text || !/[a-zA-Z]/.test(text)) return;
+      const id = ++inFlightSeq;
+      inFlightChunks.push({ id, text });
+      const remove = () => {
+        inFlightChunks = inFlightChunks.filter(c => c.id !== id);
+      };
       fetch(cleanUrl, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -332,10 +452,21 @@
       })
         .then(res => res.json())
         .then(data => {
-          appendCleanedChunk(data.cleaned || text);
+          remove();
+          const cleaned = data && data.cleaned;
+          // Client-side meta-response guard — defence-in-depth for when
+          // an older backend container is still running the prior prompt.
+          // If the cleaned output looks like the model answered the prompt
+          // instead of transforming the text, fall back to the raw input.
+          if (cleaned && !looksLikeMetaResponse(text, cleaned)) {
+            appendCleanedChunk(cleaned);
+          } else {
+            appendCleanedChunk(text);
+          }
         })
         .catch(() => {
           // Graceful fallback: use raw text if the clean request fails
+          remove();
           appendCleanedChunk(text);
         });
     }
@@ -352,11 +483,14 @@
       // state from a previous session (or an audio-session interruption from
       // the file picker) can't corrupt this one.
       if (!initRecognition()) { btnEl.disabled = false; return; }
-      preVoice     = targetEl.value;
-      accumulated  = '';
-      sessionFinal = '';
-      cleanedSoFar = '';
-      isRecording  = true;
+      preVoice           = targetEl.value;
+      shippedResultCount = 0;
+      pendingFinal       = '';
+      pendingFinalCount  = 0;
+      cleanedSoFar       = '';
+      inFlightChunks     = [];
+      isRecording        = true;
+      lastSpeechAt       = Date.now();
       if ('wakeLock' in navigator) {
         try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
       }
@@ -373,20 +507,18 @@
       targetEl.classList.remove('vtt-textarea-highlight');
       targetEl.style.display  = 'none';
       interimEl.style.display = 'block';
-      // Show existing text blurred so it feels like a continuation
-      if (preVoice.trim()) {
-        setInterimText(interimEl, preVoice, true);
-      } else {
-        interimEl.innerHTML = '';
-      }
+      // Show existing text as the cleaned prefix so it flows seamlessly
+      // into the live speech that's about to come.
+      latestInterim = '';
+      renderInterim(interimEl, preVoice, '', true);
       recognition.start();
-      startChunkTimer();
+      startTickTimer();
       btnEl.disabled = false;
     }
 
     async function stopVoice(clean) {
       if (clean === undefined) clean = true;
-      stopChunkTimer();
+      stopTickTimer();
       isRecording = false;
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
       if (recognition) {
@@ -402,7 +534,7 @@
       btnEl.innerHTML = MIC_SVG;
       if (labelEl)  labelEl.textContent  = 'Talk to text';
 
-      const remainingRaw = (accumulated + sessionFinal).trim();
+      const remainingRaw = pendingFinal.trim();
       // "Nothing heard" only if there's no cleaned text from progressive chunks either
       if (!clean || (!remainingRaw && !cleanedSoFar)) {
         interimEl.style.display = 'none';
@@ -415,7 +547,7 @@
       targetEl.style.display  = '';
       btnEl.disabled = true;
 
-      if (remainingRaw) {
+      if (remainingRaw && /[a-zA-Z]/.test(remainingRaw)) {
         // There's a final chunk not yet cleaned — send it through the same path
         if (statusEl) statusEl.textContent = 'Tidying up\u2026';
         try {
@@ -425,7 +557,12 @@
             body:    JSON.stringify({ text: remainingRaw }),
           });
           const data = await res.json();
-          appendCleanedChunk(data.cleaned || remainingRaw);
+          const cleaned = data && data.cleaned;
+          if (cleaned && !looksLikeMetaResponse(remainingRaw, cleaned)) {
+            appendCleanedChunk(cleaned);
+          } else {
+            appendCleanedChunk(remainingRaw);
+          }
           if (statusEl) statusEl.textContent = '';
         } catch {
           appendCleanedChunk(remainingRaw);
