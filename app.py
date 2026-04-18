@@ -90,12 +90,8 @@ MAX_SUBMIT_BYTES = 1 * 1024 * 1024 * 1024
 ALLOWED_MIME_PREFIXES = ("image/", "video/")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
-# Phase 1B: scoped service account — writes to `submissions` only, never `news_articles`.
-# Uses the `users` auth collection, NOT `_superusers`.
-# The old PB_NEWS_ADMIN_* vars are kept in Coolify for the promote/reject scripts only.
-PB_NEWS_SUBMISSIONS_EMAIL = os.environ.get("PB_NEWS_SUBMISSIONS_EMAIL", "")
-PB_NEWS_SUBMISSIONS_PASSWORD = os.environ.get("PB_NEWS_SUBMISSIONS_PASSWORD", "")
+NEWSROOM_API_URL = os.environ.get("NEWSROOM_API_URL", "https://my.croquetwade.com")
+NEWSROOM_API_TOKEN = os.environ.get("NEWSROOM_API_TOKEN", "")
 CLEAN_MODEL = "deepseek/deepseek-v3.2"
 
 MIN_WORD_CHARS = 3
@@ -155,22 +151,31 @@ async def lifespan(application: FastAPI):
     client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
     application.state.http = client
 
-    # ── Fail-fast auth verification ─────────────────────────────────
+    # ── Fail-fast API token verification ─────────────────────────────
+    if not NEWSROOM_API_TOKEN:
+        logger.critical(
+            "FATAL: NEWSROOM_API_TOKEN is not set.",
+            extra={"event": "api_auth_startup", "status": "fatal"},
+        )
+        await client.aclose()
+        sys.exit(1)
     try:
-        token = await _auth(client)
-        # Cache it so the first real request doesn't need a second round-trip.
-        global _pb_token
-        _pb_token = token
+        r = await client.get(
+            f"{NEWSROOM_API_URL}/api/newsroom",
+            headers={"Authorization": f"Bearer {NEWSROOM_API_TOKEN}"},
+            params={"type": "article", "scope": "all", "perPage": 1},
+        )
+        r.raise_for_status()
         logger.info(
-            "PB auth OK as %s",
-            PB_NEWS_SUBMISSIONS_EMAIL,
-            extra={"event": "pb_auth_startup", "status": "ok"},
+            "MyCroquet API ping OK at %s",
+            NEWSROOM_API_URL,
+            extra={"event": "api_auth_startup", "status": "ok"},
         )
     except Exception as exc:
         logger.critical(
-            "FATAL: PB auth failed — check PB_NEWS_SUBMISSIONS_EMAIL / PB_NEWS_SUBMISSIONS_PASSWORD. Error: %s",
+            "FATAL: MyCroquet API ping failed — check NEWSROOM_API_URL / NEWSROOM_API_TOKEN. Error: %s",
             exc,
-            extra={"event": "pb_auth_startup", "status": "fatal"},
+            extra={"event": "api_auth_startup", "status": "fatal"},
         )
         await client.aclose()
         sys.exit(1)
@@ -313,72 +318,66 @@ _CLEAN_SYSTEM_PROMPT = (
     + _DICTIONARY_HINT
 )
 
-_pb_token: str = ""
+def _mc_headers() -> dict:
+    return {"Authorization": f"Bearer {NEWSROOM_API_TOKEN}"}
 
 
-async def _auth(client: httpx.AsyncClient) -> str:
-    """Authenticate as the scoped service account (users collection, not _superusers).
-    This account can only create records in the submissions collection."""
-    r = await client.post(
-        f"{PB_NEWS_URL}/api/collections/users/auth-with-password",
-        json={"identity": PB_NEWS_SUBMISSIONS_EMAIL, "password": PB_NEWS_SUBMISSIONS_PASSWORD},
-    )
-    r.raise_for_status()
-    return r.json()["token"]
+async def _post_to_mycroquet(
+    client: httpx.AsyncClient,
+    fields: dict,
+    cover: tuple | None,
+    media_parts: list,
+) -> str:
+    """Create a content_item via MyCroquet API and submit it for review.
 
-
-async def get_token(client: httpx.AsyncClient) -> str:
-    global _pb_token
-    if not _pb_token:
-        logger.info(
-            "PocketBase auth — obtaining token",
-            extra={"event": "pb_auth_refresh", "reason": "no_token"},
-        )
-        _pb_token = await _auth(client)
-    return _pb_token
-
-
-async def refresh_token(client: httpx.AsyncClient) -> str:
-    global _pb_token
-    logger.info(
-        "PocketBase auth — refreshing expired token",
-        extra={"event": "pb_auth_refresh", "reason": "token_expired_or_rejected"},
-    )
-    _pb_token = await _auth(client)
-    return _pb_token
-
-
-async def _post_record(client: httpx.AsyncClient, token: str, fields: dict, file_parts: list):
-    """Post to the submissions collection (not news_articles).
-    The scoped service account only has createRule on submissions.
-
-    file_parts is a list of (field_name, (filename, file_handle, mime)) tuples.
-    file_handle is a seeked-to-0 SpooledTemporaryFile (or any file-like object).
-    httpx streams from the handle without loading it all into RAM.
+    cover is (filename, file_handle, mime) or None.
+    media_parts is a list of (filename, file_handle, mime) for additional files.
+    Returns the new item's id.
     """
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"{PB_NEWS_URL}/api/collections/submissions/records"
-    if file_parts:
-        # Multipart upload — use per-request extended read timeout for large files.
-        files_payload = {}
-        data_payload = fields
-        # httpx multipart: files dict maps field name → (filename, file_handle, mime)
-        # httpx reads from the handle in chunks — no full-buffer in memory.
-        for idx, (field_name, (filename, file_handle, mime)) in enumerate(file_parts):
-            key = f"{field_name}_{idx}" if idx > 0 else field_name
-            files_payload[key] = (filename, file_handle, mime)
-        return await client.post(
-            url,
-            headers=headers,
-            data=data_payload,
-            files=files_payload,
+    data: dict = {
+        "type": "article",
+        "title": fields["title"],
+        "body": fields["body"],
+        "visibility": "public",
+    }
+    files = {}
+    if cover:
+        filename, fh, mime = cover
+        files["cover_image"] = (filename, fh, mime)
+
+    r = await client.post(
+        f"{NEWSROOM_API_URL}/api/newsroom",
+        headers=_mc_headers(),
+        data=data,
+        files=files if files else None,
+        timeout=FILE_UPLOAD_TIMEOUT,
+    )
+    if not r.is_success:
+        raise HTTPException(status_code=502, detail=f"Newsroom API error: {r.text}")
+    record_id: str = r.json()["id"]
+
+    # Move to submitted so it appears in the editorial review queue.
+    patch = await client.patch(
+        f"{NEWSROOM_API_URL}/api/newsroom/{record_id}",
+        headers={**_mc_headers(), "Content-Type": "application/json"},
+        json={"status": "submitted"},
+    )
+    if not patch.is_success:
+        logger.warning("Status patch failed (non-fatal)", extra={"event": "submit_patch_fail", "id": record_id, "status": patch.status_code})
+
+    # Attach additional media files.
+    for filename, fh, mime in media_parts:
+        med = await client.post(
+            f"{NEWSROOM_API_URL}/api/newsroom/{record_id}/media",
+            headers=_mc_headers(),
+            data={"kind": "gallery"},
+            files={"file": (filename, fh, mime)},
             timeout=FILE_UPLOAD_TIMEOUT,
         )
-    return await client.post(
-        url,
-        headers=headers,
-        json=fields,
-    )
+        if not med.is_success:
+            logger.warning("Media attach failed (non-fatal)", extra={"event": "media_attach_fail", "id": record_id, "status": med.status_code})
+
+    return record_id
 
 
 class TranscriptRequest(BaseModel):
@@ -387,20 +386,25 @@ class TranscriptRequest(BaseModel):
 
 @app.get("/healthz")
 async def healthz(request: Request):
-    """Health check: forces a fresh PB auth round-trip.
+    """Health check: pings MyCroquet API.
 
-    Returns 200 with pb_auth:ok on success, 503 with pb_auth:failed on error.
+    Returns 200 with api:ok on success, 503 on error.
     Used by Docker HEALTHCHECK and Coolify monitoring.
     """
     client: httpx.AsyncClient = request.app.state.http
     try:
-        await _auth(client)
-        return {"status": "ok", "pb_auth": "ok", "pb_url": PB_NEWS_URL}
+        r = await client.get(
+            f"{NEWSROOM_API_URL}/api/newsroom",
+            headers=_mc_headers(),
+            params={"type": "article", "scope": "all", "perPage": 1},
+        )
+        r.raise_for_status()
+        return {"status": "ok", "api": "ok", "api_url": NEWSROOM_API_URL}
     except Exception as exc:
         from fastapi.responses import JSONResponse as _JSONResponse
         return _JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "pb_auth": "failed", "error": str(exc)},
+            content={"status": "unhealthy", "api": "failed", "error": str(exc)},
         )
 
 
@@ -635,24 +639,9 @@ async def submit(
 
     title = f"{event} — from {name}" if event else f"Newsroom submission from {name}"
 
-    # Phase 2: UUID suffix instead of timestamp — eliminates concurrent collisions.
-    slug = re.sub(r'[^\w\s-]', '', title.lower())
-    slug = re.sub(r'[\s_-]+', '-', slug).strip('-')[:55]
-    slug = f"{slug}-{uuid_lib.uuid4().hex[:8]}"
-
-    # Capture client IP and user agent for abuse tracing.
-    user_agent = request.headers.get("user-agent", "")[:500]
-
     fields = {
         "title": title,
-        "slug": slug,
         "body": caption,
-        "author_name": name,
-        "category": "Events",
-        "submission_uuid": submission_uuid,
-        "client_ip": client_ip,
-        "user_agent": user_agent,
-        "status": "pending",
     }
 
     # Phase 2: stream uploads via SpooledTemporaryFile.
@@ -772,7 +761,7 @@ async def submit(
             tmp.seek(0)  # rewind so httpx can read from the start
 
             if not cover_set and f.content_type.startswith("image/"):
-                file_parts.append(("cover_image", (f.filename, tmp, f.content_type)))
+                file_parts.append(("cover", (f.filename, tmp, f.content_type)))
                 cover_set = True
             else:
                 file_parts.append(("media", (f.filename, tmp, f.content_type)))
@@ -780,100 +769,22 @@ async def submit(
         file_count = len(file_parts)
         http_client: httpx.AsyncClient = request.app.state.http
 
-        # Phase 2: idempotency check — query PB for an existing record with this UUID.
-        # If found, return it immediately (handles retries + network failures gracefully).
-        try:
-            token = await get_token(http_client)
-            existing = await http_client.get(
-                f"{PB_NEWS_URL}/api/collections/submissions/records",
-                params={"filter": f'(submission_uuid="{submission_uuid}")', "perPage": 1},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if existing.status_code == 200:
-                items = existing.json().get("items", [])
-                if items:
-                    logger.info(
-                        "Idempotency hit — returning existing record",
-                        extra={
-                            "event": "submit_idempotent_hit",
-                            "submission_uuid": submission_uuid,
-                            "record_id": items[0]["id"],
-                        },
-                    )
-                    return {"ok": True, "id": items[0]["id"]}
-        except Exception as e:
-            # Non-fatal — if the check fails we proceed to create.
-            # The PB unique index is the hard backstop.
-            logger.warning(
-                "Idempotency pre-check error (non-fatal)",
-                extra={
-                    "event": "submit_idempotency_check_error",
-                    "submission_uuid": submission_uuid,
-                    "exc_type": type(e).__name__,
-                    "exc_msg": str(e),
-                },
-            )
+        cover_part = next((t for name, t in file_parts if name == "cover"), None)
+        media_parts_list = [t for name, t in file_parts if name == "media"]
 
         try:
-            token = await get_token(http_client)
-            t_pb_start = time.monotonic()
-            r = await _post_record(http_client, token, fields, file_parts)
-            if r.status_code in (401, 403):
-                token = await refresh_token(http_client)
-                # Rewind all tempfiles before the retry attempt.
-                for _, (_, fh, _) in file_parts:
-                    fh.seek(0)
-                r = await _post_record(http_client, token, fields, file_parts)
-            pb_duration_ms = round((time.monotonic() - t_pb_start) * 1000)
-
-            if not r.is_success:
-                # PB unique constraint violation on submission_uuid = duplicate submission.
-                # Treat as idempotent success: the first attempt got through.
-                if r.status_code == 400 and "submission_uuid" in r.text:
-                    logger.info(
-                        "PB unique constraint on submission_uuid — treating as success",
-                        extra={
-                            "event": "pb_submit",
-                            "status_code": r.status_code,
-                            "submission_uuid": submission_uuid,
-                            "duration_ms": pb_duration_ms,
-                            "total_upload_bytes": total_bytes,
-                            "idempotent_constraint": True,
-                        },
-                    )
-                    return {"ok": True, "id": None}
-
-                logger.error(
-                    "PocketBase error on submit",
-                    extra={
-                        "event": "pb_submit",
-                        "status_code": r.status_code,
-                        "submission_uuid": submission_uuid,
-                        "duration_ms": pb_duration_ms,
-                        "total_upload_bytes": total_bytes,
-                    },
-                )
-                duration_ms = round((time.monotonic() - t_start) * 1000)
-                logger.error(
-                    "Submit failed — pb_error",
-                    extra={
-                        "event": "submit_failure",
-                        "duration_ms": duration_ms,
-                        "failure_reason": "pb_error",
-                        "submission_uuid": submission_uuid,
-                    },
-                )
-                raise HTTPException(status_code=502, detail="Submission failed, please try again.")
-
-            record_id = r.json().get("id")
+            t_api_start = time.monotonic()
+            record_id = await _post_to_mycroquet(http_client, fields, cover_part, media_parts_list)
+            api_duration_ms = round((time.monotonic() - t_api_start) * 1000)
             logger.info(
-                "PocketBase submit succeeded",
+                "MyCroquet submit succeeded",
                 extra={
-                    "event": "pb_submit",
-                    "status_code": r.status_code,
+                    "event": "api_submit",
+                    "record_id": record_id,
                     "submission_uuid": submission_uuid,
-                    "duration_ms": pb_duration_ms,
+                    "duration_ms": api_duration_ms,
                     "total_upload_bytes": total_bytes,
+                    "file_count": file_count,
                 },
             )
 
