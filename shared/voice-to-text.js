@@ -143,7 +143,7 @@
   // Matches the same patterns the backend fallbacks catch — this is
   // defence-in-depth for when an old container is still running the
   // prior prompt and the server-side guard isn't live yet.
-  const META_START = /^\s*(i['\u2019]?|sure|certainly|okay|of course|please|here is|here's|understood)\b/i;
+  const META_START = /^\s*(sure|certainly|okay|of course|please|here is|here's|understood|i (can|will|am happy|'ll clean|'ll process)|i['\u2019]?m happy)\b/i;
   const META_PHRASES = [
     'provide the transcript',
     'provide the text',
@@ -161,6 +161,17 @@
     if (META_START.test(out)) return true;
     for (let i = 0; i < META_PHRASES.length; i++) {
       if (s.indexOf(META_PHRASES[i]) !== -1) return true;
+    }
+    // Word-overlap heuristic — if the output is much longer than the input and
+    // shares very few words with it, the model likely responded TO the prompt
+    // rather than transforming it. Only fires when the input has >= 5 words so
+    // short fragments don't produce false positives.
+    const inWords = new Set((raw.toLowerCase().match(/[a-z]+/g) || []).filter(w => w.length > 2));
+    const outWords = (out.toLowerCase().match(/[a-z]+/g) || []);
+    if (inWords.size >= 5 && outWords.length > inWords.size * 3) {
+      let overlap = 0;
+      for (const w of outWords) if (inWords.has(w)) overlap++;
+      if (overlap < Math.max(2, Math.floor(inWords.size / 3))) return true;
     }
     return false;
   }
@@ -219,17 +230,25 @@
 
   // ── Main init ────────────────────────────────────────────────────────────
   function init(opts) {
-    const targetEl  = document.getElementById(opts.target);
+    // Accept either a DOM node or a string id for any element option.
+    // This lets reply.cc pass freshly-created textarea nodes that have no id.
+    function resolveEl(val) {
+      if (!val) return null;
+      return (val instanceof HTMLElement) ? val : document.getElementById(val);
+    }
+
+    const targetEl  = resolveEl(opts.target);
     if (!targetEl) { console.error('VoiceToText: target textarea not found:', opts.target); return; }
 
-    const cleanUrl = opts.cleanUrl || '/clean';
+    // cleanUrl: null or '' means skip /clean entirely and append raw text.
+    const cleanUrl = (opts.cleanUrl === null || opts.cleanUrl === '') ? null : (opts.cleanUrl || '/clean');
     const lang     = opts.lang || 'en-AU';
 
     // Resolve or auto-create elements
-    let btnEl     = opts.button  ? document.getElementById(opts.button)  : null;
-    let interimEl = opts.interim ? document.getElementById(opts.interim) : null;
-    let statusEl  = opts.status  ? document.getElementById(opts.status)  : null;
-    let labelEl   = opts.label   ? document.getElementById(opts.label)   : null;
+    let btnEl     = resolveEl(opts.button);
+    let interimEl = resolveEl(opts.interim);
+    let statusEl  = resolveEl(opts.status);
+    let labelEl   = resolveEl(opts.label);
 
     if (!interimEl) {
       interimEl = document.createElement('div');
@@ -273,10 +292,24 @@
     // Every chunk shipped to /clean is appended here; the cleaned response
     // removes its own entry. Tracked as a list (not a single string) so two
     // overlapping round-trips can never produce a visual gap.
-    let inFlightChunks     = [];   // array of { id, text }
-    let inFlightSeq        = 0;    // monotonic id
+    let inFlightChunks     = [];   // array of { id, text } — drives the blur display
+    let inFlightSeq        = 0;    // monotonic id, doubles as chunk sequence number
+    // Seq-based ordered commit: chunks must be appended to the textarea in the
+    // order they were spoken, even if /clean responses arrive out of order.
+    let committedSeq       = 0;    // seq of the last chunk flushed to appendCleanedChunk
+    let pendingCommit      = new Map(); // seq → cleanedText, waiting for in-order flush
     function inFlightJoined() {
       return inFlightChunks.map(c => c.text).join(' ');
+    }
+
+    // Walk pendingCommit and flush any chunks that are now in order.
+    function tryFlushCommits() {
+      while (pendingCommit.has(committedSeq + 1)) {
+        committedSeq++;
+        const text = pendingCommit.get(committedSeq);
+        pendingCommit.delete(committedSeq);
+        appendCleanedChunk(text);
+      }
     }
 
     function startTickTimer() {
@@ -390,8 +423,10 @@
           pendingFinal      = '';
           pendingFinalCount = 0;
           // Fresh recognition object's event.results starts at 0, so our
-          // cursor must too.
+          // cursor must too. Also clear stale interim so it doesn't bleed
+          // into the next session's live display.
           shippedResultCount = 0;
+          latestInterim      = '';
           // Create a fresh recognition object before restarting — calling
           // recognition.start() on the same object that just fired onend
           // throws InvalidStateError on Chrome/Android, which the catch
@@ -440,34 +475,79 @@
       // Prevents the LLM from seeing a near-empty prompt and responding
       // with meta-chatter like "please provide the transcript".
       if (!text || !/[a-zA-Z]/.test(text)) return;
+
+      // noCleanup mode: cleanUrl is null/'' — bypass all /clean fetches.
+      if (!cleanUrl) {
+        const id = ++inFlightSeq;
+        inFlightChunks.push({ id, text });
+        pendingCommit.set(id, text);
+        inFlightChunks = inFlightChunks.filter(c => c.id !== id);
+        tryFlushCommits();
+        return;
+      }
+
       const id = ++inFlightSeq;
       inFlightChunks.push({ id, text });
       const remove = () => {
         inFlightChunks = inFlightChunks.filter(c => c.id !== id);
       };
+
+      // Per-chunk 15 s timeout: if the /clean response never arrives, force-
+      // commit the raw text with a marker and unblock any later chunks waiting
+      // in pendingCommit. The `settled` flag prevents both the timeout and the
+      // real response from committing the same chunk.
+      let settled = false;
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        pendingCommit.set(id, '\u2026 ' + text);
+        // Advance committedSeq through any gap so tryFlushCommits can proceed.
+        if (committedSeq < id - 1) committedSeq = id - 1;
+        tryFlushCommits();
+      }, 15000);
+
       fetch(cleanUrl, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ text }),
       })
-        .then(res => res.json())
+        .then(res => {
+          // Treat 4xx/5xx as errors so the catch block handles status UX.
+          // (fetch only rejects on network errors, not HTTP error codes.)
+          if (!res.ok) throw new Error('http_' + res.status);
+          return res.json();
+        })
         .then(data => {
-          remove();
+          if (settled) return; // timeout already committed this chunk
+          clearTimeout(timeoutId);
+          settled = true;
           const cleaned = data && data.cleaned;
           // Client-side meta-response guard — defence-in-depth for when
           // an older backend container is still running the prior prompt.
           // If the cleaned output looks like the model answered the prompt
           // instead of transforming the text, fall back to the raw input.
-          if (cleaned && !looksLikeMetaResponse(text, cleaned)) {
-            appendCleanedChunk(cleaned);
-          } else {
-            appendCleanedChunk(text);
-          }
+          const result = (cleaned && !looksLikeMetaResponse(text, cleaned)) ? cleaned : text;
+          pendingCommit.set(id, result);
+          tryFlushCommits();
         })
-        .catch(() => {
-          // Graceful fallback: use raw text if the clean request fails
+        .catch(err => {
+          if (settled) return; // timeout already committed this chunk
+          clearTimeout(timeoutId);
+          settled = true;
+          // Surface a transient status message so the user knows something
+          // was paused (413 payload too large, 429 rate limit, network drop).
+          if (statusEl) {
+            statusEl.textContent = 'Cleanup paused \u2014 raw text shown.';
+            setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+          }
+          // Graceful fallback: use raw text if the clean request fails.
+          pendingCommit.set(id, text);
+          tryFlushCommits();
+        })
+        .finally(() => {
+          // remove() ALWAYS runs — regardless of happy path, error, or throw
+          // inside the .then body — so inFlightChunks never leaks an entry.
           remove();
-          appendCleanedChunk(text);
         });
     }
 
@@ -489,6 +569,9 @@
       pendingFinalCount  = 0;
       cleanedSoFar       = '';
       inFlightChunks     = [];
+      inFlightSeq        = 0;
+      committedSeq       = 0;
+      pendingCommit      = new Map();
       isRecording        = true;
       lastSpeechAt       = Date.now();
       if ('wakeLock' in navigator) {
@@ -547,32 +630,42 @@
       targetEl.style.display  = '';
       btnEl.disabled = true;
 
-      if (remainingRaw && /[a-zA-Z]/.test(remainingRaw)) {
-        // There's a final chunk not yet cleaned — send it through the same path
-        if (statusEl) statusEl.textContent = 'Tidying up\u2026';
-        try {
-          const res  = await fetch(cleanUrl, {
-            method:  'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body:    JSON.stringify({ text: remainingRaw }),
-          });
-          const data = await res.json();
-          const cleaned = data && data.cleaned;
-          if (cleaned && !looksLikeMetaResponse(remainingRaw, cleaned)) {
-            appendCleanedChunk(cleaned);
+      // Wrap all post-stop cleanup in try/finally so the button is ALWAYS
+      // re-enabled when stopVoice() completes, even if the fetch throws or
+      // the response cannot be parsed.
+      try {
+        if (remainingRaw && /[a-zA-Z]/.test(remainingRaw)) {
+          // There's a final chunk not yet cleaned — send it synchronously.
+          if (statusEl) statusEl.textContent = 'Tidying up\u2026';
+          if (cleanUrl) {
+            try {
+              const res  = await fetch(cleanUrl, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ text: remainingRaw }),
+              });
+              const data = res.ok ? await res.json() : null;
+              const cleaned = data && data.cleaned;
+              if (cleaned && !looksLikeMetaResponse(remainingRaw, cleaned)) {
+                appendCleanedChunk(cleaned);
+              } else {
+                appendCleanedChunk(remainingRaw);
+              }
+            } catch {
+              appendCleanedChunk(remainingRaw);
+            }
           } else {
+            // noCleanup mode — append raw text directly.
             appendCleanedChunk(remainingRaw);
           }
           if (statusEl) statusEl.textContent = '';
-        } catch {
-          appendCleanedChunk(remainingRaw);
+        } else {
           if (statusEl) statusEl.textContent = '';
         }
-      } else {
-        if (statusEl) statusEl.textContent = '';
+      } finally {
+        // Button ALWAYS re-enabled — regardless of network state or thrown errors.
+        btnEl.disabled = false;
       }
-
-      btnEl.disabled = false;
 
       // Highlight textarea and show edit hint
       if (targetEl.value.trim()) {
@@ -582,12 +675,12 @@
           targetEl.classList.remove('vtt-textarea-highlight');
           hintEl.classList.remove('vtt-visible');
         }, 5000);
-        // Dismiss hint on tap
+        // Dismiss hint on focus — { once: true } auto-removes the listener so
+        // the explicit removeEventListener call is not needed.
         targetEl.addEventListener('focus', function dismissHint() {
           targetEl.classList.remove('vtt-textarea-highlight');
           hintEl.classList.remove('vtt-visible');
-          targetEl.removeEventListener('focus', dismissHint);
-        });
+        }, { once: true });
       }
     }
 
