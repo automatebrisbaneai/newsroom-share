@@ -462,6 +462,7 @@
         renderInterim(interimEl, cleanedPrefix, pendingFinal + latestInterim, true);
       } else {
         // Post-stop finalisation — textarea is the edit surface now.
+        if (statusEl) statusEl.textContent = '';
         targetEl.style.display = '';
         targetEl.classList.remove('vtt-chunk-new');
         void targetEl.offsetWidth;
@@ -618,8 +619,11 @@
       if (labelEl)  labelEl.textContent  = 'Talk to text';
 
       const remainingRaw = pendingFinal.trim();
-      // "Nothing heard" only if there's no cleaned text from progressive chunks either
-      if (!clean || (!remainingRaw && !cleanedSoFar)) {
+      // "Nothing heard" only if there's genuinely no captured speech — including
+      // chunks already shipped to /clean but not yet returned (inFlightChunks)
+      // or returned but waiting for in-order commit (pendingCommit).
+      const hasInFlight = inFlightChunks.length > 0 || pendingCommit.size > 0;
+      if (!clean || (!remainingRaw && !cleanedSoFar && !hasInFlight)) {
         interimEl.style.display = 'none';
         targetEl.style.display  = '';
         if (clean && statusEl) statusEl.textContent = 'Nothing heard \u2014 try again.';
@@ -659,6 +663,8 @@
             appendCleanedChunk(remainingRaw);
           }
           if (statusEl) statusEl.textContent = '';
+        } else if (hasInFlight) {
+          if (statusEl) statusEl.textContent = 'Tidying up\u2026';
         } else {
           if (statusEl) statusEl.textContent = '';
         }
