@@ -93,7 +93,7 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
 PB_NEWS_SUBMISSIONS_EMAIL = os.environ.get("PB_NEWS_SUBMISSIONS_EMAIL", "")
 PB_NEWS_SUBMISSIONS_PASSWORD = os.environ.get("PB_NEWS_SUBMISSIONS_PASSWORD", "")
-CLEAN_MODEL = "deepseek/deepseek-v3.2"
+CLEAN_MODEL = "deepseek/deepseek-v4-flash"
 
 MIN_WORD_CHARS = 3
 
