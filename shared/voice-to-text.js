@@ -1,5 +1,5 @@
 /**
- * Voice-to-Text v1.0
+ * Voice-to-Text v1.5
  * Drop-in voice transcription with blur interim display.
  *
  * Usage:
@@ -138,6 +138,8 @@
   // LLM mishandles — skip it until either the speaker keeps talking (so
   // the chunk grows) or MAX_CHUNK_MS fires (safety fallback).
   const MIN_CHUNK_CHARS = 40;
+  const AUTOSAVE_KEY      = 'vtt-autosave';
+  const INTERIM_MAX_WORDS = 100; // cap cleaned-prefix word count in interim display
 
   // ── Meta-response detector ──────────────────────────────────────────────
   // Matches the same patterns the backend fallbacks catch — this is
@@ -214,8 +216,17 @@
   // inside the interim div, so the user sees one flowing transcript where the
   // cleaned prefix grows in place as chunks come back from /clean.
   function renderInterim(el, cleanedText, liveText, showDot) {
-    const cleanedPart = cleanedText && cleanedText.trim()
-      ? `<span class="vtt-cleaned">${esc(cleanedText.trim())}</span>`
+    // Cap the cleaned prefix at INTERIM_MAX_WORDS so the DOM stays bounded on long sessions.
+    // The full text is already safe in the textarea; this only affects the visual display.
+    let displayCleaned = cleanedText && cleanedText.trim();
+    if (displayCleaned) {
+      const words = displayCleaned.split(/\s+/);
+      if (words.length > INTERIM_MAX_WORDS) {
+        displayCleaned = '… ' + words.slice(-INTERIM_MAX_WORDS).join(' ');
+      }
+    }
+    const cleanedPart = displayCleaned
+      ? `<span class="vtt-cleaned">${esc(displayCleaned)}</span>`
       : '';
     const liveHtml = buildLiveHtml(liveText || '', showDot);
     const joiner   = cleanedPart && liveHtml ? ' ' : '';
@@ -226,6 +237,13 @@
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // ── iOS detection ────────────────────────────────────────────────────────
+  // WakeLock absence is the primary signal (API-based); UA confirms Apple device.
+  // This avoids showing the warning on Android or desktop where WakeLock may also be absent.
+  function isIOSWithoutWakeLock() {
+    return !('wakeLock' in navigator) && /iPad|iPhone|iPod/.test(navigator.userAgent);
   }
 
   // ── Main init ────────────────────────────────────────────────────────────
@@ -294,6 +312,8 @@
     // overlapping round-trips can never produce a visual gap.
     let inFlightChunks     = [];   // array of { id, text } — drives the blur display
     let inFlightSeq        = 0;    // monotonic id, doubles as chunk sequence number
+    let postStopProcessing    = false; // true while interim stays up waiting for in-flight chunks after stop
+    let stopVoiceFetchPending = false; // true while stopVoice() is awaiting its own final-chunk fetch
     // Seq-based ordered commit: chunks must be appended to the textarea in the
     // order they were spoken, even if /clean responses arrive out of order.
     let committedSeq       = 0;    // seq of the last chunk flushed to appendCleanedChunk
@@ -309,6 +329,31 @@
         const text = pendingCommit.get(committedSeq);
         pendingCommit.delete(committedSeq);
         appendCleanedChunk(text);
+      }
+    }
+
+    // Switch from interim display to the editable textarea once all chunks have landed.
+    function finaliseToTextarea() {
+      if (!postStopProcessing) return; // guard against double-call
+      postStopProcessing = false;
+      interimEl.style.display = 'none';
+      targetEl.style.display  = '';
+      if (statusEl) statusEl.textContent = '';
+      targetEl.classList.remove('vtt-chunk-new');
+      void targetEl.offsetWidth;
+      targetEl.classList.add('vtt-chunk-new');
+      setTimeout(() => targetEl.classList.remove('vtt-chunk-new'), 450);
+      if (targetEl.value.trim()) {
+        targetEl.classList.add('vtt-textarea-highlight');
+        hintEl.classList.add('vtt-visible');
+        setTimeout(() => {
+          targetEl.classList.remove('vtt-textarea-highlight');
+          hintEl.classList.remove('vtt-visible');
+        }, 5000);
+        targetEl.addEventListener('focus', function dismissHint() {
+          targetEl.classList.remove('vtt-textarea-highlight');
+          hintEl.classList.remove('vtt-visible');
+        }, { once: true });
       }
     }
 
@@ -453,6 +498,7 @@
     function appendCleanedChunk(text) {
       cleanedSoFar = cleanedSoFar ? cleanedSoFar.trimEnd() + '\n\n' + text : text;
       setCaption(cleanedSoFar);
+      try { localStorage.setItem(AUTOSAVE_KEY, targetEl.value); } catch {}
       if (isRecording) {
         // While recording the textarea stays hidden — the interim div is
         // the single display. Re-render so the just-cleaned chunk appears
@@ -460,8 +506,10 @@
         const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()]
           .filter(Boolean).join(' ');
         renderInterim(interimEl, cleanedPrefix, pendingFinal + latestInterim, true);
-      } else {
+      } else if (!postStopProcessing) {
         // Post-stop finalisation — textarea is the edit surface now.
+        // (When postStopProcessing is true, finaliseToTextarea() handles the switch
+        // once all in-flight background chunks have landed.)
         if (statusEl) statusEl.textContent = '';
         targetEl.style.display = '';
         targetEl.classList.remove('vtt-chunk-new');
@@ -484,6 +532,9 @@
         pendingCommit.set(id, text);
         inFlightChunks = inFlightChunks.filter(c => c.id !== id);
         tryFlushCommits();
+        if (!isRecording && postStopProcessing && inFlightChunks.length === 0 && pendingCommit.size === 0) {
+          finaliseToTextarea();
+        }
         return;
       }
 
@@ -501,9 +552,18 @@
       const timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
-        pendingCommit.set(id, '\u2026 ' + text);
-        // Advance committedSeq through any gap so tryFlushCommits can proceed.
+        // Drain any earlier chunks already settled before forcing the gap closed.
+        // Without this, an earlier chunk that lands in pendingCommit before its own
+        // timeout fires would be silently dropped when committedSeq jumps past it.
+        while (pendingCommit.has(committedSeq + 1)) {
+          committedSeq++;
+          const t = pendingCommit.get(committedSeq);
+          pendingCommit.delete(committedSeq);
+          appendCleanedChunk(t);
+        }
+        // Advance committedSeq through any remaining gap so tryFlushCommits can proceed.
         if (committedSeq < id - 1) committedSeq = id - 1;
+        pendingCommit.set(id, '\u2026 ' + text);
         tryFlushCommits();
       }, 15000);
 
@@ -549,6 +609,18 @@
           // remove() ALWAYS runs — regardless of happy path, error, or throw
           // inside the .then body — so inFlightChunks never leaks an entry.
           remove();
+          // After removing this chunk, check whether all post-stop chunks have
+          // landed. This fires AFTER remove() so inFlightChunks.length is correct.
+          // Skip if stopVoice() is still awaiting its own final-chunk fetch —
+          // that fetch is not tracked in inFlightChunks/pendingCommit, so
+          // we'd otherwise call finaliseToTextarea() too early.
+          if (!isRecording && postStopProcessing && !stopVoiceFetchPending) {
+            const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
+            renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
+            if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
+              finaliseToTextarea();
+            }
+          }
         });
     }
 
@@ -569,7 +641,9 @@
       pendingFinal       = '';
       pendingFinalCount  = 0;
       cleanedSoFar       = '';
-      inFlightChunks     = [];
+      postStopProcessing    = false;
+      stopVoiceFetchPending = false;
+      inFlightChunks        = [];
       inFlightSeq        = 0;
       committedSeq       = 0;
       pendingCommit      = new Map();
@@ -587,6 +661,10 @@
       btnEl.innerHTML = STOP_SVG;
       if (labelEl)  labelEl.textContent  = 'Tap to stop';
       if (statusEl) statusEl.textContent = 'Listening\u2026';
+      if (isIOSWithoutWakeLock() && statusEl) {
+        statusEl.textContent = 'Keep screen on during recording';
+        setTimeout(() => { if (isRecording && statusEl) statusEl.textContent = 'Listening\u2026'; }, 4000);
+      }
       hintEl.classList.remove('vtt-visible');
       targetEl.classList.remove('vtt-textarea-highlight');
       targetEl.style.display  = 'none';
@@ -618,7 +696,8 @@
       btnEl.innerHTML = MIC_SVG;
       if (labelEl)  labelEl.textContent  = 'Talk to text';
 
-      const remainingRaw = pendingFinal.trim();
+      // Include latestInterim so words not yet finalized by the engine are still cleaned.
+      const remainingRaw = [pendingFinal.trim(), latestInterim.trim()].filter(Boolean).join(' ');
       // "Nothing heard" only if there's genuinely no captured speech — including
       // chunks already shipped to /clean but not yet returned (inFlightChunks)
       // or returned but waiting for in-order commit (pendingCommit).
@@ -630,8 +709,14 @@
         return;
       }
 
-      interimEl.style.display = 'none';
-      targetEl.style.display  = '';
+      // Keep the interim visible — don't re-render here, just remove the pulsing
+      // dot so the display freezes on whatever the last recording render showed.
+      // Re-rendering risks producing empty content (e.g. if latestInterim has
+      // words that pendingFinal hasn't captured yet). finaliseToTextarea() will
+      // handle the switch to the editable textarea once all chunks have landed.
+      postStopProcessing = true;
+      const dotEl = interimEl.querySelector('.vtt-dot');
+      if (dotEl) dotEl.remove();
       btnEl.disabled = true;
 
       // Wrap all post-stop cleanup in try/finally so the button is ALWAYS
@@ -642,6 +727,7 @@
           // There's a final chunk not yet cleaned — send it synchronously.
           if (statusEl) statusEl.textContent = 'Tidying up\u2026';
           if (cleanUrl) {
+            stopVoiceFetchPending = true;
             try {
               const res  = await fetch(cleanUrl, {
                 method:  'POST',
@@ -657,12 +743,13 @@
               }
             } catch {
               appendCleanedChunk(remainingRaw);
+            } finally {
+              stopVoiceFetchPending = false;
             }
           } else {
             // noCleanup mode — append raw text directly.
             appendCleanedChunk(remainingRaw);
           }
-          if (statusEl) statusEl.textContent = '';
         } else if (hasInFlight) {
           if (statusEl) statusEl.textContent = 'Tidying up\u2026';
         } else {
@@ -673,20 +760,15 @@
         btnEl.disabled = false;
       }
 
-      // Highlight textarea and show edit hint
-      if (targetEl.value.trim()) {
-        targetEl.classList.add('vtt-textarea-highlight');
-        hintEl.classList.add('vtt-visible');
-        setTimeout(() => {
-          targetEl.classList.remove('vtt-textarea-highlight');
-          hintEl.classList.remove('vtt-visible');
-        }, 5000);
-        // Dismiss hint on focus — { once: true } auto-removes the listener so
-        // the explicit removeEventListener call is not needed.
-        targetEl.addEventListener('focus', function dismissHint() {
-          targetEl.classList.remove('vtt-textarea-highlight');
-          hintEl.classList.remove('vtt-visible');
-        }, { once: true });
+      // Update interim: show the just-cleaned text as unblurred prefix, keep any
+      // remaining in-flight chunks blurred. Only render if there are still background
+      // chunks pending — otherwise finaliseToTextarea() is about to hide the interim.
+      if (postStopProcessing && inFlightChunks.length > 0) {
+        const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
+        renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
+      }
+      if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
+        finaliseToTextarea();
       }
     }
 
@@ -695,7 +777,13 @@
     });
 
     // Return control object for programmatic use
-    return { start: startVoice, stop: stopVoice, isRecording: () => isRecording };
+    return {
+      start:        startVoice,
+      stop:         stopVoice,
+      isRecording:  () => isRecording,
+      savedSession: () => { try { return localStorage.getItem(AUTOSAVE_KEY) || null; } catch { return null; } },
+      clearSaved:   () => { try { localStorage.removeItem(AUTOSAVE_KEY); } catch {} },
+    };
   }
 
   // ── Export ──────────────────────────────────────────────────────────────
