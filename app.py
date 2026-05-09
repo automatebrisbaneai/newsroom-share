@@ -91,8 +91,8 @@ ALLOWED_MIME_PREFIXES = ("image/", "video/")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
-PB_NEWS_SUBMISSIONS_EMAIL = os.environ.get("PB_NEWS_SUBMISSIONS_EMAIL", "")
-PB_NEWS_SUBMISSIONS_PASSWORD = os.environ.get("PB_NEWS_SUBMISSIONS_PASSWORD", "")
+PB_NEWS_ADMIN_EMAIL = os.environ.get("PB_NEWS_ADMIN_EMAIL", "")
+PB_NEWS_ADMIN_PASSWORD = os.environ.get("PB_NEWS_ADMIN_PASSWORD", "")
 CLEAN_MODEL = "deepseek/deepseek-v4-flash"
 
 MIN_WORD_CHARS = 3
@@ -145,10 +145,17 @@ _pb_token: str = ""
 
 
 async def _auth(client: httpx.AsyncClient) -> str:
-    """Authenticate as the scoped service account against pb-news."""
+    """Authenticate as superuser against pb-news.
+
+    Uses the same _superusers/auth-with-password pattern as every other
+    server-to-PB writer in the codebase. The previous scoped service-account
+    pattern (users collection + per-collection createRule) drifted on
+    2026-05-09 (verified=false + tokenKey=none caused createRule rejections)
+    and was the only such pattern in the codebase. Reverted 2026-05-10.
+    """
     r = await client.post(
-        f"{PB_NEWS_URL}/api/collections/users/auth-with-password",
-        json={"identity": PB_NEWS_SUBMISSIONS_EMAIL, "password": PB_NEWS_SUBMISSIONS_PASSWORD},
+        f"{PB_NEWS_URL}/api/collections/_superusers/auth-with-password",
+        json={"identity": PB_NEWS_ADMIN_EMAIL, "password": PB_NEWS_ADMIN_PASSWORD},
     )
     r.raise_for_status()
     return r.json()["token"]
@@ -184,12 +191,12 @@ async def lifespan(application: FastAPI):
         _pb_token = token
         logger.info(
             "PB auth OK as %s",
-            PB_NEWS_SUBMISSIONS_EMAIL,
+            PB_NEWS_ADMIN_EMAIL,
             extra={"event": "pb_auth_startup", "status": "ok"},
         )
     except Exception as exc:
         logger.critical(
-            "FATAL: PB auth failed — check PB_NEWS_SUBMISSIONS_EMAIL / PB_NEWS_SUBMISSIONS_PASSWORD. Error: %s",
+            "FATAL: PB auth failed — check PB_NEWS_ADMIN_EMAIL / PB_NEWS_ADMIN_PASSWORD. Error: %s",
             exc,
             extra={"event": "pb_auth_startup", "status": "fatal"},
         )
@@ -405,6 +412,37 @@ async def _post_to_pocketbase(
         break
 
     if not r.is_success:
+        cover_size = 0
+        cover_mime = ""
+        if cover:
+            _, cover_fh, cover_mime = cover
+            try:
+                pos = cover_fh.tell()
+                cover_fh.seek(0, 2)
+                cover_size = cover_fh.tell()
+                cover_fh.seek(pos)
+            except Exception:
+                pass
+        logger.error(
+            "PB content_items create failed",
+            extra={
+                "event": "pb_create_failure",
+                "pb_status": r.status_code,
+                "pb_body": r.text[:1000],
+                "auth_method": "_superusers",
+                "fields_sent": {
+                    "type": data.get("type"),
+                    "status": data.get("status"),
+                    "visibility": data.get("visibility"),
+                    "slug": data.get("slug"),
+                    "title_len": len(data.get("title", "")),
+                    "body_len": len(data.get("body", "")),
+                },
+                "cover_size_bytes": cover_size,
+                "cover_mime": cover_mime,
+                "media_count": len(media_parts),
+            },
+        )
         raise HTTPException(status_code=502, detail=f"PB write error: {r.text}")
 
     record_id: str = r.json()["id"]
