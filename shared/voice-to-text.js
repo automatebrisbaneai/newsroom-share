@@ -333,8 +333,20 @@
     }
 
     // Switch from interim display to the editable textarea once all chunks have landed.
+    // Pending resolvers that are waiting for the post-stop cleanup to complete.
+    // Each call to stopVoice() awaits one of these; finaliseToTextarea() drains
+    // them. Lets callers do `await VTT.stop()` to know "all transcription
+    // POSTs are done and the textarea is the canonical source of truth."
+    const finaliseResolvers = [];
+    function drainFinaliseResolvers() {
+      while (finaliseResolvers.length) {
+        const r = finaliseResolvers.shift();
+        try { r(); } catch {}
+      }
+    }
+
     function finaliseToTextarea() {
-      if (!postStopProcessing) return; // guard against double-call
+      if (!postStopProcessing) { drainFinaliseResolvers(); return; }
       postStopProcessing = false;
       interimEl.style.display = 'none';
       targetEl.style.display  = '';
@@ -343,6 +355,7 @@
       void targetEl.offsetWidth;
       targetEl.classList.add('vtt-chunk-new');
       setTimeout(() => targetEl.classList.remove('vtt-chunk-new'), 450);
+      drainFinaliseResolvers();
       if (targetEl.value.trim()) {
         targetEl.classList.add('vtt-textarea-highlight');
         hintEl.classList.add('vtt-visible');
@@ -680,6 +693,12 @@
 
     async function stopVoice(clean) {
       if (clean === undefined) clean = true;
+      // Resolver for callers awaiting full post-stop completion. Queued now;
+      // drained either inline on early-return paths or by finaliseToTextarea.
+      let doneFn;
+      const donePromise = new Promise(r => { doneFn = r; });
+      finaliseResolvers.push(doneFn);
+
       stopTickTimer();
       isRecording = false;
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
@@ -706,7 +725,8 @@
         interimEl.style.display = 'none';
         targetEl.style.display  = '';
         if (clean && statusEl) statusEl.textContent = 'Nothing heard \u2014 try again.';
-        return;
+        drainFinaliseResolvers();
+        return donePromise;
       }
 
       // Keep the interim visible — don't re-render here, just remove the pulsing
@@ -770,6 +790,7 @@
       if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
         finaliseToTextarea();
       }
+      return donePromise;
     }
 
     btnEl.addEventListener('click', () => {
