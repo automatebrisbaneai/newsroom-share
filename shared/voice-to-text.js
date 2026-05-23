@@ -239,6 +239,18 @@
     return d.innerHTML;
   }
 
+  // ── Header injection ────────────────────────────────────────────────────
+  // Page can set window.VTT_EXTRA_HEADERS = {"X-Talk-Key": "…"} before this
+  // library loads to send extra headers on every /clean POST. Empty/missing
+  // is the default (no extra headers, full backward compatibility).
+  function extraHeaders() {
+    const h = window.VTT_EXTRA_HEADERS;
+    return (h && typeof h === 'object') ? h : {};
+  }
+  function postCleanHeaders() {
+    return Object.assign({ 'Content-Type': 'application/json' }, extraHeaders());
+  }
+
   // ── iOS detection ────────────────────────────────────────────────────────
   // WakeLock absence is the primary signal (API-based); UA confirms Apple device.
   // This avoids showing the warning on Android or desktop where WakeLock may also be absent.
@@ -582,7 +594,7 @@
 
       fetch(cleanUrl, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: postCleanHeaders(),
         body:    JSON.stringify({ text }),
       })
         .then(res => {
@@ -751,7 +763,7 @@
             try {
               const res  = await fetch(cleanUrl, {
                 method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: postCleanHeaders(),
                 body:    JSON.stringify({ text: remainingRaw }),
               });
               const data = res.ok ? await res.json() : null;
