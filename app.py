@@ -509,7 +509,9 @@ async def root():
 # the shared/ directory is always at /app/shared/ (copied by the Dockerfile
 # `COPY . .` step). Local dev must mirror the same layout.
 SHARED_FILES = {
-    "voice-to-text.js": "application/javascript",
+    # voice-to-text.js retired 2026-05-24 — consumers now load it cross-domain
+    # from talk.croquetwade.com (the single canonical source). The dictionary
+    # stays because app.py reads it server-side for the LLM prompt.
     "croquet-dictionary.json": "application/json",
 }
 
