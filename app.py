@@ -89,11 +89,12 @@ MAX_SUBMIT_BYTES = 1 * 1024 * 1024 * 1024
 # Phase 0: accepted MIME prefixes for uploaded files
 ALLOWED_MIME_PREFIXES = ("image/", "video/")
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENCODE_GO_KEY = os.environ.get("OPENCODE_GO_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
 PB_NEWS_URL = os.environ.get("PB_NEWS_URL", "https://pb-news.croquetwade.com")
 PB_NEWS_ADMIN_EMAIL = os.environ.get("PB_NEWS_ADMIN_EMAIL", "")
 PB_NEWS_ADMIN_PASSWORD = os.environ.get("PB_NEWS_ADMIN_PASSWORD", "")
-CLEAN_MODEL = "deepseek/deepseek-v4-flash"
+CLEAN_MODEL = "deepseek-v4-flash"  # OpenCode Go bare slug
+OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 
 MIN_WORD_CHARS = 3
 
@@ -560,10 +561,11 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
     try:
         t_or_start = time.monotonic()
         res = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            OPENCODE_GO_URL,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {OPENCODE_GO_KEY}",
                 "Content-Type": "application/json",
+                "User-Agent": "croquetwade-worker/1.0",
             },
             json={
                 "model": CLEAN_MODEL,
@@ -571,6 +573,7 @@ async def clean_transcript(request: Request, req: TranscriptRequest):
                     {"role": "system", "content": _CLEAN_SYSTEM_PROMPT},
                     {"role": "user", "content": raw},
                 ],
+                # DeepSeek V4 on OpenCode burns ~100 hidden reasoning tokens — 4096 has headroom.
                 "max_tokens": 4096,
             },
         )
