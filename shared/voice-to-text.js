@@ -325,11 +325,15 @@
     let inFlightChunks     = [];   // array of { id, text } — drives the blur display
     let inFlightSeq        = 0;    // monotonic id, doubles as chunk sequence number
     let postStopProcessing    = false; // true while interim stays up waiting for in-flight chunks after stop
-    let stopVoiceFetchPending = false; // true while stopVoice() is awaiting its own final-chunk fetch
     // Seq-based ordered commit: chunks must be appended to the textarea in the
     // order they were spoken, even if /clean responses arrive out of order.
     let committedSeq       = 0;    // seq of the last chunk flushed to appendCleanedChunk
     let pendingCommit      = new Map(); // seq → cleanedText, waiting for in-order flush
+    // Shared settlement state so a timeout firing for chunk N can force-settle
+    // earlier in-flight chunks too. Without this, a late-returning earlier
+    // chunk would land in pendingCommit under a seq already passed by
+    // committedSeq, and never flush — wedging the transcript forever.
+    let settledChunks      = new Set();
     function inFlightJoined() {
       return inFlightChunks.map(c => c.text).join(' ');
     }
@@ -544,6 +548,37 @@
       }
     }
 
+    // Force-settle every in-flight chunk whose id <= maxId AND not yet settled.
+    // Called from a timeout handler so late-returning earlier chunks cannot
+    // be lost beyond committedSeq. Each forced chunk gets a placeholder
+    // ('… <raw>') in pendingCommit; subsequent tryFlushCommits drains
+    // them in order so the textarea always finalises.
+    function forceSettleUpTo(maxId) {
+      const toForce = inFlightChunks
+        .filter(c => c.id <= maxId && !settledChunks.has(c.id))
+        .sort((a, b) => a.id - b.id);
+      for (const c of toForce) {
+        settledChunks.add(c.id);
+        if (!pendingCommit.has(c.id)) {
+          pendingCommit.set(c.id, '… ' + c.text);
+        }
+      }
+    }
+
+    // Shared post-chunk bookkeeping. Called from EVERY settlement path
+    // (background success/error/timeout AND the stop-time chunk) so the
+    // finalisation logic lives in one place.
+    function afterChunkSettled(id) {
+      inFlightChunks = inFlightChunks.filter(c => c.id !== id);
+      if (!isRecording && postStopProcessing) {
+        const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
+        renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
+        if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
+          finaliseToTextarea();
+        }
+      }
+    }
+
     function cleanChunkInBackground(text) {
       // Noise guard — skip chunks that have no transcribable content.
       // Prevents the LLM from seeing a near-empty prompt and responding
@@ -554,41 +589,23 @@
       if (!cleanUrl) {
         const id = ++inFlightSeq;
         inFlightChunks.push({ id, text });
+        settledChunks.add(id);
         pendingCommit.set(id, text);
-        inFlightChunks = inFlightChunks.filter(c => c.id !== id);
         tryFlushCommits();
-        if (!isRecording && postStopProcessing && inFlightChunks.length === 0 && pendingCommit.size === 0) {
-          finaliseToTextarea();
-        }
+        afterChunkSettled(id);
         return;
       }
 
       const id = ++inFlightSeq;
       inFlightChunks.push({ id, text });
-      const remove = () => {
-        inFlightChunks = inFlightChunks.filter(c => c.id !== id);
-      };
 
-      // Per-chunk 15 s timeout: if the /clean response never arrives, force-
-      // commit the raw text with a marker and unblock any later chunks waiting
-      // in pendingCommit. The `settled` flag prevents both the timeout and the
-      // real response from committing the same chunk.
-      let settled = false;
+      // Per-chunk 15s timeout. When this fires we force-settle this chunk AND
+      // every earlier in-flight chunk \u2014 see forceSettleUpTo(). The shared
+      // settledChunks Set lets the late-returning fetch short-circuit when it
+      // finally resolves, so no chunk is ever lost OR double-appended.
       const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        // Drain any earlier chunks already settled before forcing the gap closed.
-        // Without this, an earlier chunk that lands in pendingCommit before its own
-        // timeout fires would be silently dropped when committedSeq jumps past it.
-        while (pendingCommit.has(committedSeq + 1)) {
-          committedSeq++;
-          const t = pendingCommit.get(committedSeq);
-          pendingCommit.delete(committedSeq);
-          appendCleanedChunk(t);
-        }
-        // Advance committedSeq through any remaining gap so tryFlushCommits can proceed.
-        if (committedSeq < id - 1) committedSeq = id - 1;
-        pendingCommit.set(id, '\u2026 ' + text);
+        if (settledChunks.has(id)) return;
+        forceSettleUpTo(id);
         tryFlushCommits();
       }, 15000);
 
@@ -604,9 +621,9 @@
           return res.json();
         })
         .then(data => {
-          if (settled) return; // timeout already committed this chunk
+          if (settledChunks.has(id)) return; // timeout already settled this chunk
           clearTimeout(timeoutId);
-          settled = true;
+          settledChunks.add(id);
           const cleaned = data && data.cleaned;
           // Client-side meta-response guard — defence-in-depth for when
           // an older backend container is still running the prior prompt.
@@ -617,9 +634,9 @@
           tryFlushCommits();
         })
         .catch(err => {
-          if (settled) return; // timeout already committed this chunk
+          if (settledChunks.has(id)) return; // timeout already settled this chunk
           clearTimeout(timeoutId);
-          settled = true;
+          settledChunks.add(id);
           // Surface a transient status message so the user knows something
           // was paused (413 payload too large, 429 rate limit, network drop).
           if (statusEl) {
@@ -631,21 +648,10 @@
           tryFlushCommits();
         })
         .finally(() => {
-          // remove() ALWAYS runs — regardless of happy path, error, or throw
-          // inside the .then body — so inFlightChunks never leaks an entry.
-          remove();
-          // After removing this chunk, check whether all post-stop chunks have
-          // landed. This fires AFTER remove() so inFlightChunks.length is correct.
-          // Skip if stopVoice() is still awaiting its own final-chunk fetch —
-          // that fetch is not tracked in inFlightChunks/pendingCommit, so
-          // we'd otherwise call finaliseToTextarea() too early.
-          if (!isRecording && postStopProcessing && !stopVoiceFetchPending) {
-            const cleanedPrefix = [preVoice.trim(), cleanedSoFar.trim()].filter(Boolean).join(' ');
-            renderInterim(interimEl, cleanedPrefix, inFlightJoined(), false);
-            if (inFlightChunks.length === 0 && pendingCommit.size === 0) {
-              finaliseToTextarea();
-            }
-          }
+          // afterChunkSettled runs exactly once per chunk regardless of
+          // outcome (resolve / reject / timeout) so inFlightChunks never
+          // leaks and post-stop finalisation runs at the right moment.
+          afterChunkSettled(id);
         });
     }
 
@@ -667,11 +673,11 @@
       pendingFinalCount  = 0;
       cleanedSoFar       = '';
       postStopProcessing    = false;
-      stopVoiceFetchPending = false;
       inFlightChunks        = [];
       inFlightSeq        = 0;
       committedSeq       = 0;
       pendingCommit      = new Map();
+      settledChunks      = new Set();
       isRecording        = true;
       lastSpeechAt       = Date.now();
       if ('wakeLock' in navigator) {
@@ -756,27 +762,49 @@
       // the response cannot be parsed.
       try {
         if (remainingRaw && /[a-zA-Z]/.test(remainingRaw)) {
-          // There's a final chunk not yet cleaned — send it synchronously.
           if (statusEl) statusEl.textContent = 'Tidying up\u2026';
+          // Route the stop-time chunk through the SAME id/inFlightChunks/
+          // pendingCommit pipeline as background chunks. Ordering: if earlier
+          // background chunks are still in flight, this one waits its turn.
+          // Finalisation: afterChunkSettled fires finaliseToTextarea once
+          // everything has landed, no stopVoiceFetchPending bookkeeping.
           if (cleanUrl) {
-            stopVoiceFetchPending = true;
+            const id = ++inFlightSeq;
+            inFlightChunks.push({ id, text: remainingRaw });
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => {
+              if (settledChunks.has(id)) return;
+              controller.abort();
+              forceSettleUpTo(id);
+              tryFlushCommits();
+              afterChunkSettled(id);
+            }, 15000);
             try {
-              const res  = await fetch(cleanUrl, {
+              const res = await fetch(cleanUrl, {
                 method:  'POST',
                 headers: postCleanHeaders(),
                 body:    JSON.stringify({ text: remainingRaw }),
+                signal:  controller.signal,
               });
-              const data = res.ok ? await res.json() : null;
-              const cleaned = data && data.cleaned;
-              if (cleaned && !looksLikeMetaResponse(remainingRaw, cleaned)) {
-                appendCleanedChunk(cleaned);
-              } else {
-                appendCleanedChunk(remainingRaw);
+              if (!settledChunks.has(id)) {
+                clearTimeout(timeoutId);
+                settledChunks.add(id);
+                const data = res.ok ? await res.json() : null;
+                const cleaned = data && data.cleaned;
+                const result = (cleaned && !looksLikeMetaResponse(remainingRaw, cleaned))
+                  ? cleaned : remainingRaw;
+                pendingCommit.set(id, result);
+                tryFlushCommits();
+                afterChunkSettled(id);
               }
             } catch {
-              appendCleanedChunk(remainingRaw);
-            } finally {
-              stopVoiceFetchPending = false;
+              if (!settledChunks.has(id)) {
+                clearTimeout(timeoutId);
+                settledChunks.add(id);
+                pendingCommit.set(id, remainingRaw);
+                tryFlushCommits();
+                afterChunkSettled(id);
+              }
             }
           } else {
             // noCleanup mode — append raw text directly.
