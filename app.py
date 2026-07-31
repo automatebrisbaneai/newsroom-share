@@ -14,7 +14,7 @@ import bleach
 import httpx
 import magic
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response as FastAPIResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response as FastAPIResponse
 from pydantic import BaseModel
 from pathlib import Path
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -499,8 +499,12 @@ async def healthz(request: Request):
 
 @app.get("/")
 async def root():
-    html_path = Path(__file__).parent / "index.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    # 2026-08-01: re-routed to the newer, richer public submission form on
+    # news.croquetqld.org. This app's other endpoints (/submit, /clean,
+    # /healthz, /shared/*) are untouched and stay live for existing consumers
+    # and the daily smoke test. index.html is left in place so this can be
+    # reverted in one line if needed.
+    return RedirectResponse(url="https://news.croquetqld.org/add-news", status_code=307)
 
 
 
